@@ -1,8 +1,9 @@
+
 //
-//  LlamaExecutorTests.swift
 //  LlamaModelExecutor
 //
-//  Created by luca travaglini on 20/06/2026.
+//  Copyright (c) 2026 Luca Travaglini. All rights reserved.
+//  Licensed under MIT License. See LICENSE file for details.
 //
 
 import Testing
