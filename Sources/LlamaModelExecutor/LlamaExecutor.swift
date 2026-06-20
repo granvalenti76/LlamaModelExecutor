@@ -1,4 +1,3 @@
-
 //
 //  LlamaModelExecutor
 //
@@ -55,29 +54,17 @@ public struct LlamaExecutor: LanguageModelExecutor {
         model: LlamaModel,
         streamingInto channel: LanguageModelExecutorGenerationChannel
     ) async throws {
-        // 1. Convert transcript entries into OpenAI-style messages
-        let messages = try convertTranscriptEntries(request.transcript)
+        // 1. Build the HTTP request via RequestBuilder
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: configuration.modelName,
+            temperature: configuration.temperature,
+            maxTokens: configuration.maxTokens,
+            baseURL: configuration.baseURL
+        )
 
-        // 2. Build the request body
-        let temperature = request.generationOptions.temperature ?? configuration.temperature
-        let maxTokens = request.generationOptions.maximumResponseTokens ?? configuration.maxTokens
-        let modelName = configuration.modelName
-
-        var body: [String: Any] = [
-            "model": modelName,
-            "messages": messages,
-            "stream": true,
-            "temperature": temperature,
-            "max_tokens": maxTokens,
-        ]
-
-        var urlRequest = URLRequest(url: configuration.baseURL.appendingPathComponent("chat/completions"))
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        // 3. Perform streaming request
-        let (lines, response) = try await transport.lines(for: urlRequest)
+        // 2. Perform streaming request
+        let (lines, response) = try await transport.lines(for: built.urlRequest)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw LlamaError.invalidResponse
@@ -87,7 +74,7 @@ public struct LlamaExecutor: LanguageModelExecutor {
             throw LlamaError.httpError(statusCode: httpResponse.statusCode)
         }
 
-        // 4. Parse SSE stream
+        // 3. Parse SSE stream
         var promptTokens = 0
         var completionTokens = 0
         var malformedChunkCount = 0
@@ -96,51 +83,48 @@ public struct LlamaExecutor: LanguageModelExecutor {
         for try await line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // Skip empty lines
             guard !trimmed.isEmpty else { continue }
-
-            // Only process "data:" lines
             guard trimmed.hasPrefix("data: ") else { continue }
             let payload = String(trimmed.dropFirst(6))
 
-            // The stream is done
             guard payload != "[DONE]" else { break }
-
             guard let jsonData = payload.data(using: .utf8) else { continue }
 
             do {
                 let chunk = try decoder.decode(StreamChunk.self, from: jsonData)
 
                 if let choice = chunk.choices?.first {
-                    // Send reasoning text as reasoning events
+                    // Reasoning content
                     if let reasoning = choice.delta?.reasoning_content, !reasoning.isEmpty {
                         let action = LanguageModelExecutorGenerationChannel.Reasoning.Action.appendText(
                             reasoning,
                             segmentID: nil,
                             tokenCount: reasoning.count
                         )
-                        let event = LanguageModelExecutorGenerationChannel.Reasoning.reasoning(
-                            entryID: request.id.uuidString,
-                            action: action
+                        await channel.send(
+                            LanguageModelExecutorGenerationChannel.Reasoning.reasoning(
+                                entryID: request.id.uuidString,
+                                action: action
+                            )
                         )
-                        await channel.send(event)
                     }
 
-                    // Send content text as response events (skip nulls from role announcement)
+                    // Response text
                     if let content = choice.delta?.content, !content.isEmpty {
                         let action = LanguageModelExecutorGenerationChannel.Response.Action.appendText(
                             content,
                             segmentID: nil,
                             tokenCount: content.count
                         )
-                        let event = LanguageModelExecutorGenerationChannel.Response.response(
-                            entryID: request.id.uuidString,
-                            action: action
+                        await channel.send(
+                            LanguageModelExecutorGenerationChannel.Response.response(
+                                entryID: request.id.uuidString,
+                                action: action
+                            )
                         )
-                        await channel.send(event)
                     }
 
-                    // Capture usage from the standard field or from llama.cpp timings
+                    // Token counts
                     if let usage = chunk.usage {
                         promptTokens = usage.prompt_tokens ?? 0
                         completionTokens = usage.completion_tokens ?? 0
@@ -160,78 +144,15 @@ public struct LlamaExecutor: LanguageModelExecutor {
             }
         }
 
-        // 5. Send final usage update
-        let usageInput = LanguageModelExecutorGenerationChannel.Usage.Input(
-            totalTokenCount: promptTokens,
-            cachedTokenCount: 0
+        // 4. Send final usage update
+        await channel.send(
+            LanguageModelExecutorGenerationChannel.Response.response(
+                entryID: request.id.uuidString,
+                action: .updateUsage(
+                    input: .init(totalTokenCount: promptTokens, cachedTokenCount: 0),
+                    output: .init(totalTokenCount: completionTokens, reasoningTokenCount: 0)
+                )
+            )
         )
-        let usageOutput = LanguageModelExecutorGenerationChannel.Usage.Output(
-            totalTokenCount: completionTokens,
-            reasoningTokenCount: 0
-        )
-        let usageAction = LanguageModelExecutorGenerationChannel.Response.Action.updateUsage(
-            input: usageInput,
-            output: usageOutput
-        )
-        let usageEvent = LanguageModelExecutorGenerationChannel.Response.response(
-            entryID: request.id.uuidString,
-            action: usageAction
-        )
-        await channel.send(usageEvent)
-    }
-
-    // MARK: - Private helpers
-
-    /// Convert FoundationModels transcript entries into OpenAI chat message dictionaries.
-    private func convertTranscriptEntries(_ transcript: Transcript) throws -> [[String: Any]] {
-        var messages: [[String: Any]] = []
-
-        for entry in transcript {
-            switch entry {
-            case .instructions(let instructions):
-                let text = extractText(from: instructions.segments)
-                if !text.isEmpty {
-                    messages.append(["role": "system", "content": text])
-                }
-
-            case .prompt(let prompt):
-                let text = extractText(from: prompt.segments)
-                messages.append(["role": "user", "content": text])
-
-            case .response(let response):
-                let text = extractText(from: response.segments)
-                messages.append(["role": "assistant", "content": text])
-
-            case .toolCalls:
-                break
-            case .toolOutput:
-                break
-            case .reasoning:
-                break
-            @unknown default:
-                break
-            }
-        }
-
-        return messages
-    }
-
-    /// Extract plain text from an array of transcript segments.
-    private func extractText(from segments: [Transcript.Segment]) -> String {
-        segments.compactMap { segment in
-            switch segment {
-            case .text(let textSegment):
-                return textSegment.content
-            case .structure(let structuredSegment):
-                return String(describing: structuredSegment.content)
-            case .attachment:
-                return nil
-            case .custom:
-                return nil
-            @unknown default:
-                return nil
-            }
-        }.joined()
     }
 }
-

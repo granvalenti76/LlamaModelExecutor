@@ -40,11 +40,9 @@ package struct StreamChunk: Decodable, Sendable {
     /// during streaming.
     package struct Timings: Decodable, Sendable {
         /// Number of prompt tokens processed.
-        public let prompt_n: Int?
+        package let prompt_n: Int?
         /// Number of tokens predicted so far.
-        public let predicted_n: Int?
-        /// Tokens per second during the decoding phase (server-reported).
-        public let predicted_per_second: Double?
+        package let predicted_n: Int?
     }
 
     public let choices: [Choice]?
