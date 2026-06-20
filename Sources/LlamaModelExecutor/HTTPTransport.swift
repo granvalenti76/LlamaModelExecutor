@@ -25,10 +25,13 @@ public protocol HTTPTransport: Sendable {
 public struct URLSessionTransport: HTTPTransport {
     private let session: URLSession
 
+    /// Creates a transport backed by the given URL session.
+    /// - Parameter session: The URL session to use (defaults to ``URLSession.shared``).
     public init(session: URLSession = .shared) {
         self.session = session
     }
 
+    /// Non-streaming request. Returns the full response body.
     public func data(for request: URLRequest) async throws -> (Data, URLResponse) {
         try await session.data(for: request)
     }

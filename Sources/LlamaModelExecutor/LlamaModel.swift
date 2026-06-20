@@ -17,8 +17,11 @@ public struct LlamaModel: LanguageModel, Sendable {
 
     // MARK: - LanguageModel conformance
 
+    /// Capabilities advertised by this model.
+    /// Currently empty — no tool calling, vision, or reasoning advertised.
     public var capabilities: LanguageModelCapabilities
 
+    /// The configuration used to create this model, surfaced as required by ``LanguageModel``.
     public var executorConfiguration: LlamaConfiguration {
         configuration
     }
@@ -32,6 +35,8 @@ public struct LlamaModel: LanguageModel, Sendable {
 
     // MARK: - Initializer
 
+    /// Creates a model that communicates with a llama.cpp server.
+    /// - Parameter configuration: Connection and generation parameters.
     public init(configuration: LlamaConfiguration) {
         self.configuration = configuration
         self.capabilities = LanguageModelCapabilities(capabilities: [])

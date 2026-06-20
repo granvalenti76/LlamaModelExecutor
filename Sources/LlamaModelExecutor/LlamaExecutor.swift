@@ -22,6 +22,9 @@ public struct LlamaExecutor: LanguageModelExecutor {
     private let transport: HTTPTransport
     private let decoder: JSONDecoder
 
+    /// Creates an executor with a custom transport.
+    /// - Parameter configuration: Connection and generation parameters.
+    /// - Parameter transport: The HTTP transport to use. Inject a fake in tests.
     public init(configuration: Configuration, transport: HTTPTransport) throws {
         self.configuration = configuration
         self.transport = transport
@@ -42,12 +45,17 @@ public struct LlamaExecutor: LanguageModelExecutor {
 
     // MARK: - prewarm
 
+    /// No-op for remote server.
     public func prewarm(model: LlamaModel, transcript: Transcript) {
         // Nothing to prewarm for a remote server.
     }
 
     // MARK: - respond
 
+    /// Streams a response from llama-server, translating SSE deltas into channel events.
+    /// - Parameter request: The generation request from FoundationModels.
+    /// - Parameter model: The model that initiated the request.
+    /// - Parameter channel: Event channel for streaming deltas and usage.
     nonisolated(nonsending)
     public func respond(
         to request: LanguageModelExecutorGenerationRequest,
