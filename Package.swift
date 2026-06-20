@@ -5,6 +5,11 @@ import PackageDescription
 
 let package = Package(
     name: "LlamaModelExecutor",
+    
+    platforms: [
+        .iOS("27.0"), .macOS("27.0"), .visionOS("27.0"), .watchOS("27.0"),
+      ],
+    
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
