@@ -12,11 +12,11 @@ import Foundation
 /// Every `data:` line in the stream (except `[DONE]`) is decoded into this shape.
 /// The same model is reused for every chunk — fields that are absent on the wire
 /// simply decode as `nil`.
-public struct StreamChunk: Decodable, Sendable {
+package struct StreamChunk: Decodable, Sendable {
     /// A single streaming choice.
-    public struct Choice: Decodable, Sendable {
+    package struct Choice: Decodable, Sendable {
         /// The delta payload carried by this choice.
-        public struct Delta: Decodable, Sendable {
+        package struct Delta: Decodable, Sendable {
             /// Role announcement (present only on the very first chunk).
             public let role: String?
             /// Content delta emitted during normal text generation.
@@ -30,14 +30,14 @@ public struct StreamChunk: Decodable, Sendable {
 
     /// Standard OpenAI usage payload (usually present on the last streaming chunk,
     /// or on the non-streaming response).
-    public struct Usage: Decodable, Sendable {
+    package struct Usage: Decodable, Sendable {
         public let prompt_tokens: Int?
         public let completion_tokens: Int?
     }
 
     /// llama.cpp puts detailed timing info here instead of the standard `usage` field
     /// during streaming.
-    public struct Timings: Decodable, Sendable {
+    package struct Timings: Decodable, Sendable {
         /// Number of prompt tokens processed.
         public let prompt_n: Int?
         /// Number of tokens predicted so far.

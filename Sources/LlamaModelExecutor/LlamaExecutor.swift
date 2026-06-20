@@ -89,7 +89,6 @@ public struct LlamaExecutor: LanguageModelExecutor {
         // 4. Parse SSE stream
         var promptTokens = 0
         var completionTokens = 0
-        var tokensPerSecond: Double?
         var malformedChunkCount = 0
         let maxMalformedChunks = 5
 
@@ -147,9 +146,6 @@ public struct LlamaExecutor: LanguageModelExecutor {
                     } else if let timings = chunk.timings {
                         promptTokens = timings.prompt_n ?? 0
                         completionTokens = timings.predicted_n ?? 0
-                        if let predictedPerSecond = timings.predicted_per_second {
-                            tokensPerSecond = predictedPerSecond
-                        }
                     }
                 }
             } catch {
