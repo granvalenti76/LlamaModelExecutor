@@ -42,6 +42,8 @@ public struct StreamChunk: Decodable, Sendable {
         public let prompt_n: Int?
         /// Number of tokens predicted so far.
         public let predicted_n: Int?
+        /// Tokens per second during the decoding phase (server-reported).
+        public let predicted_per_second: Double?
     }
 
     public let choices: [Choice]?

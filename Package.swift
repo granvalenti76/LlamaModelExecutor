@@ -29,6 +29,13 @@ let package = Package(
                 .enableUpcomingFeature("StrictConcurrency=complete"),
             ],
         ),
+        .testTarget(
+            name: "LlamaModelExecutorTests",
+            dependencies: ["LlamaModelExecutor"],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency=complete"),
+            ],
+        ),
 
     ],
     swiftLanguageModes: [.v6]

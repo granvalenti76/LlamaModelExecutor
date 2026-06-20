@@ -8,7 +8,7 @@
 import Foundation
 
 /// Errors that can occur during communication with llama-server.
-enum LlamaError: Error, LocalizedError {
+enum LlamaError: Error, LocalizedError, Equatable {
     case invalidResponse
     case httpError(statusCode: Int)
     case streamError(String)

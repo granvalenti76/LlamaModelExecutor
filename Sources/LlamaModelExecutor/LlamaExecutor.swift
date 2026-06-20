@@ -62,7 +62,7 @@ public struct LlamaExecutor: LanguageModelExecutor {
         let maxTokens = request.generationOptions.maximumResponseTokens ?? configuration.maxTokens
         let modelName = configuration.modelName
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": modelName,
             "messages": messages,
             "stream": true,
@@ -89,6 +89,7 @@ public struct LlamaExecutor: LanguageModelExecutor {
         // 4. Parse SSE stream
         var promptTokens = 0
         var completionTokens = 0
+        var tokensPerSecond: Double?
 
         for try await line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -144,6 +145,9 @@ public struct LlamaExecutor: LanguageModelExecutor {
                     } else if let timings = chunk.timings {
                         promptTokens = timings.prompt_n ?? 0
                         completionTokens = timings.predicted_n ?? 0
+                        if let predictedPerSecond = timings.predicted_per_second {
+                            tokensPerSecond = predictedPerSecond
+                        }
                     }
                 }
             } catch {
@@ -227,3 +231,8 @@ public struct LlamaExecutor: LanguageModelExecutor {
     }
 }
 
+/// Keys used for metadata sent through ``LanguageModelExecutorGenerationChannel``.
+enum LlamaMetadata {
+    /// Tokens per second reported by llama.cpp server timings (decoding phase only).
+    static let tokensPerSecond = "llama_tokens_per_second"
+}
