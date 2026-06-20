@@ -238,8 +238,3 @@ public struct LlamaExecutor: LanguageModelExecutor {
     }
 }
 
-/// Keys used for metadata sent through ``LanguageModelExecutorGenerationChannel``.
-enum LlamaMetadata {
-    /// Tokens per second reported by llama.cpp server timings (decoding phase only).
-    static let tokensPerSecond = "llama_tokens_per_second"
-}
