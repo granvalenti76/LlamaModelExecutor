@@ -18,7 +18,7 @@ let package = Package(
         .target(
             name: "LlamaModelExecutor",
             swiftSettings: [
-                .enableUpcomingFeature("ApproachableConcurrency"),
+                .enableUpcomingFeature("StrictConcurrency=complete"),
             ],
         ),
 
