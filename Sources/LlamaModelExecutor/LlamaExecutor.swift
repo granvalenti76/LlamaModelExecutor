@@ -90,6 +90,8 @@ public struct LlamaExecutor: LanguageModelExecutor {
         var promptTokens = 0
         var completionTokens = 0
         var tokensPerSecond: Double?
+        var malformedChunkCount = 0
+        let maxMalformedChunks = 5
 
         for try await line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -151,7 +153,12 @@ public struct LlamaExecutor: LanguageModelExecutor {
                     }
                 }
             } catch {
-                // Skip malformed chunks
+                malformedChunkCount += 1
+                if malformedChunkCount >= maxMalformedChunks {
+                    throw LlamaError.streamError(
+                        "\(malformedChunkCount) consecutive malformed SSE chunks — aborting"
+                    )
+                }
                 continue
             }
         }
