@@ -85,6 +85,8 @@ public struct LlamaExecutor: LanguageModelExecutor {
         // 3. Parse SSE stream
         var promptTokens = 0
         var completionTokens = 0
+        var reasoningTokens = 0
+        var lastTimings: StreamChunk.Timings?
         var malformedChunkCount = 0
         let maxMalformedChunks = 5
 
@@ -102,8 +104,11 @@ public struct LlamaExecutor: LanguageModelExecutor {
                 let chunk = try decoder.decode(StreamChunk.self, from: jsonData)
 
                 if let choice = chunk.choices?.first {
-                    // Reasoning content
+                    // Reasoning content: forward delta events and accumulate token count.
+                    // llama.cpp does not report completion_tokens_details.reasoning_tokens,
+                    // so we estimate reasoning tokens from the character count of each delta.
                     if let reasoning = choice.delta?.reasoning_content, !reasoning.isEmpty {
+                        reasoningTokens += reasoning.count
                         let action = LanguageModelExecutorGenerationChannel.Reasoning.Action.appendText(
                             reasoning,
                             segmentID: nil,
@@ -132,14 +137,27 @@ public struct LlamaExecutor: LanguageModelExecutor {
                         )
                     }
 
-                    // Token counts
+                    // Token counts from the standard OpenAI usage payload.
                     if let usage = chunk.usage {
                         promptTokens = usage.prompt_tokens ?? 0
                         completionTokens = usage.completion_tokens ?? 0
-                    } else if let timings = chunk.timings {
-                        promptTokens = timings.prompt_n ?? 0
-                        completionTokens = timings.predicted_n ?? 0
+                        // Prefer server-reported reasoning tokens when available.
+                        // Otherwise reasoningTokens is already accumulated from reasoning_content deltas.
+                        if let serverReasoning = usage.completion_tokens_details?.reasoning_tokens {
+                            reasoningTokens = serverReasoning
+                        }
                     }
+                }
+
+                // llama.cpp sends token counts via the timings field (not usage).
+                if let timings = chunk.timings, chunk.usage == nil {
+                    promptTokens = timings.prompt_n ?? 0
+                    completionTokens = timings.predicted_n ?? 0
+                }
+
+                // Capture timing metadata regardless (predicted_per_second, etc.).
+                if let timings = chunk.timings {
+                    lastTimings = timings
                 }
             } catch {
                 malformedChunkCount += 1
@@ -152,13 +170,32 @@ public struct LlamaExecutor: LanguageModelExecutor {
             }
         }
 
-        // 4. Send final usage update
+        // 4. Forward timing metadata (predicted_per_second, etc.) as response metadata.
+        if let timings = lastTimings {
+            var metadata: [String: any Sendable & Codable & Equatable] = [:]
+            if let perSecond = timings.predicted_per_second {
+                metadata["predicted_per_second"] = perSecond
+            }
+            if let perTokenMs = timings.predicted_per_token_ms {
+                metadata["predicted_per_token_ms"] = perTokenMs
+            }
+            if !metadata.isEmpty {
+                await channel.send(
+                    LanguageModelExecutorGenerationChannel.Response.response(
+                        entryID: request.id.uuidString,
+                        action: .updateMetadata(metadata)
+                    )
+                )
+            }
+        }
+
+        // 5. Send final usage update with reasoning token count.
         await channel.send(
             LanguageModelExecutorGenerationChannel.Response.response(
                 entryID: request.id.uuidString,
                 action: .updateUsage(
                     input: .init(totalTokenCount: promptTokens, cachedTokenCount: 0),
-                    output: .init(totalTokenCount: completionTokens, reasoningTokenCount: 0)
+                    output: .init(totalTokenCount: completionTokens, reasoningTokenCount: reasoningTokens)
                 )
             )
         )

@@ -1,4 +1,3 @@
-
 //
 //  LlamaModelExecutor
 //
@@ -32,17 +31,32 @@ package struct StreamChunk: Decodable, Sendable {
     /// Standard OpenAI usage payload (usually present on the last streaming chunk,
     /// or on the non-streaming response).
     package struct Usage: Decodable, Sendable {
+        /// Number of tokens in the prompt.
         public let prompt_tokens: Int?
+        /// Number of tokens generated in the completion.
         public let completion_tokens: Int?
+        /// Breakdown of completion tokens reported by the model.
+        /// Populated by models that distinguish reasoning from output tokens (e.g. Gemma).
+        public let completion_tokens_details: CompletionTokensDetails?
+
+        /// Breakdown of completion token counts.
+        package struct CompletionTokensDetails: Decodable, Sendable {
+            /// Number of tokens used for reasoning / chain-of-thought.
+            public let reasoning_tokens: Int?
+        }
     }
 
     /// llama.cpp puts detailed timing info here instead of the standard `usage` field
-    /// during streaming.
+    /// during streaming. These values are forwarded as response metadata.
     package struct Timings: Decodable, Sendable {
         /// Number of prompt tokens processed.
         package let prompt_n: Int?
         /// Number of tokens predicted so far.
         package let predicted_n: Int?
+        /// Prediction throughput in tokens per second.
+        package let predicted_per_second: Double?
+        /// Average time per predicted token in milliseconds.
+        package let predicted_per_token_ms: Double?
     }
 
     public let choices: [Choice]?
