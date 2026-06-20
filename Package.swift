@@ -4,17 +4,22 @@ import PackageDescription
 
 let package = Package(
     name: "LlamaModelExecutor",
-    
+
     platforms: [
         .iOS("27.0"), .macOS("27.0"), .visionOS("27.0"), .watchOS("27.0"),
-      ],
-    
+    ],
+
     products: [
         .library(
             name: "LlamaModelExecutor",
             targets: ["LlamaModelExecutor"]
         ),
     ],
+
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.0"),
+    ],
+
     targets: [
         .target(
             name: "LlamaModelExecutor",
