@@ -445,3 +445,284 @@ struct LlamaExecutorIntegrationTests {
         #expect(!foundMetadata)
     }
 }
+
+// MARK: - SSEStreamParser unit tests
+
+@Suite("SSEStreamParser")
+struct SSEStreamParserTests {
+
+    let decoder = JSONDecoder()
+
+    /// Helper: creates a stream from raw SSE lines (with or without "data: " prefix).
+    private func makeStream(_ lines: [String]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            for line in lines {
+                continuation.yield(line)
+            }
+            continuation.finish()
+        }
+    }
+
+    @Test("yields decoded chunks from valid SSE lines")
+    func validSSELines() async throws {
+        let raw = [
+            "data: \(MockJSON.textDelta("Hello"))",
+            "data: \(MockJSON.textDelta(" World"))",
+            "data: \(MockJSON.done)",
+        ]
+        let parser = SSEStreamParser()
+        var chunks: [StreamChunk] = []
+
+        for try await chunk in parser.parse(makeStream(raw)) {
+            chunks.append(chunk)
+        }
+
+        #expect(chunks.count == 2)
+        #expect(chunks[0].choices?.first?.delta?.content == "Hello")
+        #expect(chunks[1].choices?.first?.delta?.content == " World")
+    }
+
+    @Test("skips empty lines and non-data lines")
+    func skipsNoise() async throws {
+        let raw = [
+            "",
+            "data: \(MockJSON.textDelta("A"))",
+            ": heartbeat",
+            "data: \(MockJSON.textDelta("B"))",
+            "random text",
+            "data: \(MockJSON.done)",
+        ]
+        let parser = SSEStreamParser()
+        var chunks: [StreamChunk] = []
+
+        for try await chunk in parser.parse(makeStream(raw)) {
+            chunks.append(chunk)
+        }
+
+        #expect(chunks.count == 2)
+        #expect(chunks[0].choices?.first?.delta?.content == "A")
+        #expect(chunks[1].choices?.first?.delta?.content == "B")
+    }
+
+    @Test("terminates early on [DONE] and ignores subsequent lines")
+    func doneTerminates() async throws {
+        let raw = [
+            "data: \(MockJSON.textDelta("First"))",
+            "data: \(MockJSON.done)",
+            "data: \(MockJSON.textDelta("Ignored"))",  // after [DONE]
+        ]
+        let parser = SSEStreamParser()
+        var chunks: [StreamChunk] = []
+
+        for try await chunk in parser.parse(makeStream(raw)) {
+            chunks.append(chunk)
+        }
+
+        #expect(chunks.count == 1)
+        #expect(chunks[0].choices?.first?.delta?.content == "First")
+    }
+
+    @Test("throws after exceeding malformed chunk threshold")
+    func malformedThreshold() async throws {
+        let raw = [
+            "data: not-json",
+            "data: also-not-json",
+            "data: still-not-json",
+            "data: nope",
+            "data: invalid",
+        ]
+        let parser = SSEStreamParser(maxMalformedChunks: 3)
+
+        await #expect(throws: LlamaError.streamError("3 consecutive malformed SSE chunks — aborting")) {
+            for try await _ in parser.parse(makeStream(raw)) { }
+        }
+    }
+
+    @Test("resets malformed counter after a valid chunk")
+    func malformedCounterResets() async throws {
+        let raw = [
+            "data: bad-json",
+            "data: \(MockJSON.textDelta("Valid"))",
+            "data: bad-again",
+            "data: also-bad",
+            "data: still-bad",
+        ]
+        let parser = SSEStreamParser(maxMalformedChunks: 3)
+        var chunks: [StreamChunk] = []
+
+        // The counter resets after the valid chunk, so we need 3 consecutive
+        // malformed chunks after that to trigger the throw.
+        // "bad-again", "also-bad", "still-bad" = 3 → throw.
+        await #expect(throws: LlamaError.streamError("3 consecutive malformed SSE chunks — aborting")) {
+            for try await chunk in parser.parse(makeStream(raw)) {
+                chunks.append(chunk)
+            }
+        }
+
+        #expect(chunks.count == 1)
+    }
+
+    @Test("empty stream yields no chunks")
+    func emptyStream() async throws {
+        let parser = SSEStreamParser()
+        var count = 0
+
+        for try await _ in parser.parse(makeStream([])) {
+            count += 1
+        }
+
+        #expect(count == 0)
+    }
+}
+
+// MARK: - TokenTracker unit tests
+
+@Suite("TokenTracker")
+struct TokenTrackerTests {
+
+    @Test("starts with zero counts")
+    func initialValues() {
+        var tracker = TokenTracker()
+        let counts = tracker.finalize()
+
+        #expect(counts.promptTokens == 0)
+        #expect(counts.completionTokens == 0)
+        #expect(counts.reasoningTokens == 0)
+        #expect(counts.timingMetadata.isEmpty)
+    }
+
+    @Test("usage overrides prompt and completion tokens")
+    func usageUpdatesTokens() {
+        let json = MockJSON.finishWithUsage(promptTokens: 10, completionTokens: 20)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.promptTokens == 10)
+        #expect(counts.completionTokens == 20)
+    }
+
+    @Test("timings updates tokens when usage absent")
+    func timingsFallback() {
+        let json = MockJSON.finishWithTimingsOnly(promptTokens: 7, completionTokens: 15)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.promptTokens == 7)
+        #expect(counts.completionTokens == 15)
+    }
+
+    @Test("usage takes priority over timings in same chunk")
+    func usagePriorityInSameChunk() {
+        // finishWithUsage has both usage and timings.
+        let json = MockJSON.finishWithUsage(promptTokens: 10, completionTokens: 20)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        // usage has prompt_tokens=10, timings has prompt_n=10 (same value here)
+        // The key is that usage was read, not timings.
+        #expect(counts.promptTokens == 10)
+        #expect(counts.completionTokens == 20)
+    }
+
+    @Test("usage overrides previous timings when it arrives later")
+    func usageOverridesPreviousTimings() {
+        let timingsJson = MockJSON.finishWithTimingsOnly(promptTokens: 5, completionTokens: 8)
+        let timingsData = timingsJson.data(using: .utf8)!
+        let timingsChunk = try! JSONDecoder().decode(StreamChunk.self, from: timingsData)
+
+        let usageJson = MockJSON.finishWithUsage(promptTokens: 10, completionTokens: 20)
+        let usageData = usageJson.data(using: .utf8)!
+        let usageChunk = try! JSONDecoder().decode(StreamChunk.self, from: usageData)
+
+        var tracker = TokenTracker()
+        tracker.update(from: timingsChunk)  // first: timings
+        tracker.update(from: usageChunk)    // then: usage overrides
+
+        let counts = tracker.finalize()
+        #expect(counts.promptTokens == 10)   // from usage
+        #expect(counts.completionTokens == 20) // from usage
+    }
+
+    @Test("reasoning: character accumulation fallback")
+    func reasoningAccumulated() {
+        var tracker = TokenTracker()
+        tracker.accountReasoning(delta: "Think")
+        tracker.accountReasoning(delta: " step by step")
+
+        let counts = tracker.finalize()
+        #expect(counts.reasoningTokens == 18)  // "Think" (5) + " step by step" (13) = 18
+    }
+
+    @Test("reasoning: server-reported takes priority over accumulated")
+    func reasoningServerPriority() {
+        let json = MockJSON.finishWithUsageAndReasoning(promptTokens: 10, completionTokens: 20, reasoningTokens: 8)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.accountReasoning(delta: "Some long reasoning text that would be many tokens")  // 49 chars
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.reasoningTokens == 8)  // server-reported, not 49
+    }
+
+    @Test("metadata extracted from timings")
+    func timingMetadata() {
+        let json = MockJSON.finishWithTimingsOnly(promptTokens: 10, completionTokens: 20)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.timingMetadata["predicted_per_second"] as? Double == 42.5)
+        #expect(counts.timingMetadata["predicted_per_token_ms"] as? Double == 23.5)
+    }
+
+    @Test("metadata only contains predicted_per_second when timings lack per_token_ms")
+    func metadataOnlyPerSecond() throws {
+        // MockJSON.finish() includes predicted_per_second:50.0 but no predicted_per_token_ms.
+        let json = MockJSON.finish(promptTokens: 5, completionTokens: 3)
+        let data = json.data(using: .utf8)!
+        let chunk = try JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.timingMetadata.count == 1)
+        #expect(counts.timingMetadata["predicted_per_second"] as? Double == 50.0)
+        #expect(counts.timingMetadata["predicted_per_token_ms"] == nil)
+    }
+
+    @Test("finalize is idempotent")
+    func finalizeIdempotent() {
+        let json = MockJSON.finishWithUsage(promptTokens: 10, completionTokens: 20)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let first = tracker.finalize()
+        let second = tracker.finalize()
+
+        #expect(first.promptTokens == second.promptTokens)
+        #expect(first.completionTokens == second.completionTokens)
+        #expect(first.reasoningTokens == second.reasoningTokens)
+    }
+}
