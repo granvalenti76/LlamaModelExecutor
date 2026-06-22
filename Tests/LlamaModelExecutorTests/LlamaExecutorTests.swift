@@ -86,6 +86,27 @@ enum MockJSON {
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":\(promptTokens),\"completion_tokens\":\(completionTokens),\"completion_tokens_details\":{\"reasoning_tokens\":\(reasoningTokens)}},\"timings\":{\"prompt_n\":\(promptTokens),\"predicted_n\":\(completionTokens),\"predicted_per_second\":50.0}}"
     }
 
+    // MARK: - Tool-call deltas (OpenAI SSE format)
+
+    /// First delta for a tool call: carries id, type, function.name, and an empty arguments string.
+    static func toolCallStart(index: Int = 0, id: String = "call_1", name: String = "get_weather") -> String {
+        """
+        {"choices":[{"delta":{"tool_calls":[{"index":\(index),"id":"\(id)","type":"function","function":{"name":"\(name)","arguments":""}}]}}]}
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Subsequent delta: carries only function.arguments (streaming JSON fragment).
+    static func toolCallArguments(index: Int = 0, arguments: String) -> String {
+        """
+        {"choices":[{"delta":{"tool_calls":[{"index":\(index),"function":{"arguments":"\(arguments)"}}]}}]}
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Tool-call finish chunk: finish_reason is "tool_calls".
+    static let toolCallFinish = """
+    {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"timings":{"prompt_n":10,"predicted_n":5,"predicted_per_second":50.0}}
+    """.trimmingCharacters(in: .whitespacesAndNewlines)
+
     static let done = "[DONE]"
 }
 
@@ -724,5 +745,211 @@ struct TokenTrackerTests {
         #expect(first.promptTokens == second.promptTokens)
         #expect(first.completionTokens == second.completionTokens)
         #expect(first.reasoningTokens == second.reasoningTokens)
+    }
+}
+
+// MARK: - Tool-call delta decoding tests
+
+@Suite("StreamChunk tool-call decoding")
+struct StreamChunkToolCallDecodingTests {
+
+    let decoder = JSONDecoder()
+
+    @Test("decodes tool_calls delta with id, type, function.name")
+    func toolCallStart() throws {
+        let json = MockJSON.toolCallStart(index: 0, id: "call_42", name: "get_weather")
+        let data = json.data(using: .utf8)!
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        let delta = try #require(chunk.choices?.first?.delta)
+        let calls = try #require(delta.tool_calls)
+        #expect(calls.count == 1)
+        #expect(calls[0].index == 0)
+        #expect(calls[0].id == "call_42")
+        #expect(calls[0].type == "function")
+        let fn = try #require(calls[0].function)
+        #expect(fn.name == "get_weather")
+        #expect(fn.arguments == "")
+    }
+
+    @Test("decodes tool_calls delta with only arguments")
+    func toolCallArguments() throws {
+        // Use a plain text fragment that does not require JSON-in-JSON escaping.
+        let json = MockJSON.toolCallArguments(index: 0, arguments: "latitude")
+        let data = json.data(using: .utf8)!
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        let delta = try #require(chunk.choices?.first?.delta)
+        let calls = try #require(delta.tool_calls)
+        #expect(calls.count == 1)
+        #expect(calls[0].index == 0)
+        #expect(calls[0].id == nil)           // only on first delta
+        #expect(calls[0].function?.name == nil)  // only on first delta
+        #expect(calls[0].function?.arguments == "latitude")
+    }
+
+    @Test("decodes finish_reason tool_calls")
+    func toolCallFinish() throws {
+        let json = MockJSON.toolCallFinish
+        let data = json.data(using: .utf8)!
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        #expect(chunk.choices?.first?.finish_reason == "tool_calls")
+        #expect(chunk.timings?.predicted_per_second == 50.0)
+    }
+
+    @Test("tool_calls defaults to nil when absent")
+    func toolCallsNilWhenAbsent() throws {
+        let json = MockJSON.textDelta("Hello")
+        let data = json.data(using: .utf8)!
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        let delta = try #require(chunk.choices?.first?.delta)
+        #expect(delta.tool_calls == nil)
+        #expect(delta.content == "Hello")
+    }
+}
+
+// MARK: - RequestBuilder tool-call tests
+
+@Suite("RequestBuilder tool handling")
+struct RequestBuilderToolTests {
+
+    let config = LlamaConfiguration(modelName: "test")
+    let baseURL = URL(string: "http://127.0.0.1:8080/v1")!
+
+    @Test("build does not include tools when enabledToolDefinitions is empty")
+    func noToolsWhenEmpty() throws {
+        let entry = Transcript.Entry.prompt(
+            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "Hi"))])
+        )
+        let request = LanguageModelExecutorGenerationRequest(
+            id: UUID(),
+            transcript: Transcript(entries: [entry]),
+            enabledTools: [],
+            generationOptions: GenerationOptions(),
+            contextOptions: ContextOptions(),
+            metadata: [:]
+        )
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: "test-model",
+            temperature: 0.7,
+            maxTokens: 100,
+            baseURL: baseURL
+        )
+
+        let body = try JSONSerialization.jsonObject(with: built.urlRequest.httpBody!) as! [String: Any]
+        #expect(body["tools"] == nil)
+        #expect(body["tool_choice"] == nil)
+    }
+
+    @Test("build includes tools when enabledToolDefinitions is provided")
+    func toolsPresent() throws {
+        let entry = Transcript.Entry.prompt(
+            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "Hi"))])
+        )
+        let schema = GenerationSchema(
+            type: String.self,
+            description: "A city name",
+            properties: []
+        )
+        let toolDef = Transcript.ToolDefinition(
+            name: "get_weather",
+            description: "Get the weather for a city",
+            parameters: schema
+        )
+        let request = LanguageModelExecutorGenerationRequest(
+            id: UUID(),
+            transcript: Transcript(entries: [entry]),
+            enabledTools: [toolDef],
+            generationOptions: GenerationOptions(),
+            contextOptions: ContextOptions(),
+            metadata: [:]
+        )
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: "test-model",
+            temperature: 0.7,
+            maxTokens: 100,
+            baseURL: baseURL
+        )
+
+        let body = try JSONSerialization.jsonObject(with: built.urlRequest.httpBody!) as! [String: Any]
+        let tools = try #require(body["tools"] as? [[String: Any]])
+        #expect(tools.count == 1)
+        #expect(tools[0]["type"] as? String == "function")
+        let fn = try #require(tools[0]["function"] as? [String: Any])
+        #expect(fn["name"] as? String == "get_weather")
+        #expect(fn["description"] as? String == "Get the weather for a city")
+        #expect(fn["parameters"] is [String: Any])
+    }
+
+    @Test("tool_choice is none when toolCallingMode is disallowed")
+    func toolChoiceDisallowed() throws {
+        let entry = Transcript.Entry.prompt(
+            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "Hi"))])
+        )
+        let schema = GenerationSchema(type: String.self, description: "", properties: [])
+        let toolDef = Transcript.ToolDefinition(
+            name: "test", description: "", parameters: schema
+        )
+        let request = LanguageModelExecutorGenerationRequest(
+            id: UUID(),
+            transcript: Transcript(entries: [entry]),
+            enabledTools: [toolDef],
+            generationOptions: GenerationOptions(
+                samplingMode: nil,
+                temperature: nil,
+                maximumResponseTokens: nil,
+                toolCallingMode: .disallowed
+            ),
+            contextOptions: ContextOptions(),
+            metadata: [:]
+        )
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: "test",
+            temperature: 0.7,
+            maxTokens: 100,
+            baseURL: baseURL
+        )
+
+        let body = try JSONSerialization.jsonObject(with: built.urlRequest.httpBody!) as! [String: Any]
+        #expect(body["tool_choice"] as? String == "none")
+    }
+
+    @Test("tool_choice is required when toolCallingMode is required")
+    func toolChoiceRequired() throws {
+        let entry = Transcript.Entry.prompt(
+            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "Hi"))])
+        )
+        let schema = GenerationSchema(type: String.self, description: "", properties: [])
+        let toolDef = Transcript.ToolDefinition(
+            name: "test", description: "", parameters: schema
+        )
+        let request = LanguageModelExecutorGenerationRequest(
+            id: UUID(),
+            transcript: Transcript(entries: [entry]),
+            enabledTools: [toolDef],
+            generationOptions: GenerationOptions(
+                samplingMode: nil,
+                temperature: nil,
+                maximumResponseTokens: nil,
+                toolCallingMode: .required
+            ),
+            contextOptions: ContextOptions(),
+            metadata: [:]
+        )
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: "test",
+            temperature: 0.7,
+            maxTokens: 100,
+            baseURL: baseURL
+        )
+
+        let body = try JSONSerialization.jsonObject(with: built.urlRequest.httpBody!) as! [String: Any]
+        #expect(body["tool_choice"] as? String == "required")
     }
 }

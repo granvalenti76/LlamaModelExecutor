@@ -92,6 +92,10 @@ public struct LlamaExecutor: LanguageModelExecutor {
         var tracker = TokenTracker()
         let forwarder = ChannelForwarder(channel: channel, entryID: request.id.uuidString)
 
+        // Track active tool calls by stream index so we can correlate
+        // arguments fragments with their id/name (sent only on the first delta).
+        var activeToolCalls: [Int: (id: String, name: String)] = [:]
+
         for try await chunk in parser.parse(lines) {
             tracker.update(from: chunk)
 
@@ -105,6 +109,28 @@ public struct LlamaExecutor: LanguageModelExecutor {
                 // Response-text delta.
                 if let content = choice.delta?.content, !content.isEmpty {
                     await forwarder.sendResponse(text: content, tokenCount: content.count)
+                }
+
+                // Tool-call delta — the model is requesting a tool invocation.
+                if let toolCallDeltas = choice.delta?.tool_calls {
+                    for delta in toolCallDeltas {
+                        // Correlate id/name from the first delta or reuse tracked values.
+                        let callID = delta.id ?? activeToolCalls[delta.index]?.id ?? ""
+                        let callName = delta.function?.name ?? activeToolCalls[delta.index]?.name ?? ""
+
+                        if activeToolCalls[delta.index] == nil {
+                            activeToolCalls[delta.index] = (id: callID, name: callName)
+                        }
+
+                        if let args = delta.function?.arguments, !args.isEmpty {
+                            await forwarder.sendToolCall(
+                                id: callID,
+                                name: callName,
+                                fragment: args,
+                                tokenCount: args.count
+                            )
+                        }
+                    }
                 }
             }
         }

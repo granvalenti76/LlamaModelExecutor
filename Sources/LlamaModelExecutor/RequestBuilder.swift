@@ -41,13 +41,31 @@ package enum RequestBuilder {
         let resolvedTemperature = request.generationOptions.temperature ?? temperature
         let resolvedMaxTokens = request.generationOptions.maximumResponseTokens ?? maxTokens
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": modelName,
             "messages": messages,
             "stream": true,
             "temperature": resolvedTemperature,
             "max_tokens": resolvedMaxTokens,
         ]
+
+        // Include tool definitions and tool_choice when tools are registered.
+        if !request.enabledToolDefinitions.isEmpty {
+            body["tools"] = try convertToolDefinitions(request.enabledToolDefinitions)
+
+            if let mode = request.generationOptions.toolCallingMode {
+                switch mode.kind {
+                case .required:
+                    body["tool_choice"] = "required"
+                case .disallowed:
+                    body["tool_choice"] = "none"
+                case .allowed:
+                    break  // let the model decide (default behaviour)
+                @unknown default:
+                    break
+                }
+            }
+        }
 
         var urlRequest = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
         urlRequest.httpMethod = "POST"
@@ -79,10 +97,32 @@ package enum RequestBuilder {
                 let text = extractText(from: response.segments)
                 messages.append(["role": "assistant", "content": text])
 
-            case .toolCalls:
-                break
-            case .toolOutput:
-                break
+            case .toolCalls(let toolCalls):
+                let toolCallDicts: [[String: Any]] = toolCalls.map { call in
+                    // GeneratedContent is not Encodable, but its description
+                    // yields valid JSON for previously-emitted tool calls.
+                    let argsJSON = String(describing: call.arguments)
+                    return [
+                        "id": call.id,
+                        "type": "function",
+                        "function": [
+                            "name": call.toolName,
+                            "arguments": argsJSON,
+                        ],
+                    ]
+                }
+                messages.append([
+                    "role": "assistant",
+                    "tool_calls": toolCallDicts,
+                ])
+
+            case .toolOutput(let output):
+                let text = extractText(from: output.segments)
+                messages.append([
+                    "role": "tool",
+                    "tool_call_id": output.id,
+                    "content": text,
+                ])
             case .reasoning:
                 break
             @unknown default:
@@ -91,6 +131,26 @@ package enum RequestBuilder {
         }
 
         return messages
+    }
+
+    /// Convert FoundationModels tool definitions into the OpenAI `tools` array format.
+    private static func convertToolDefinitions(
+        _ tools: [Transcript.ToolDefinition]
+    ) throws -> [[String: Any]] {
+        let encoder = JSONEncoder()
+        return try tools.map { tool in
+            let paramsData = try encoder.encode(tool.parameters)
+            let paramsJSON = try JSONSerialization.jsonObject(with: paramsData)
+                as? [String: Any] ?? [:]
+            return [
+                "type": "function",
+                "function": [
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": paramsJSON,
+                ],
+            ]
+        }
     }
 
     /// Extract plain text from an array of transcript segments.

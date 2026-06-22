@@ -93,6 +93,40 @@ package struct ChannelForwarder: Sendable {
         )
     }
 
+    // MARK: - Tool call delta
+
+    /// Forwards a tool‑call arguments fragment.
+    ///
+    /// Each SSE delta for a tool call carries an arguments fragment (JSON).
+    /// The first delta for a given tool call also provides `id` and `name`.
+    /// - Parameters:
+    ///   - id: The unique identifier for this tool call.
+    ///   - name: The name of the function being called.
+    ///   - fragment: A JSON fragment of the arguments.
+    ///   - tokenCount: Estimated token count.
+    package func sendToolCall(
+        id: String,
+        name: String,
+        fragment: String,
+        tokenCount: Int
+    ) async {
+        let toolAction = LanguageModelExecutorGenerationChannel.ToolCalls.ToolCall.Action.appendArguments(
+            fragment,
+            tokenCount: tokenCount
+        )
+        let action = LanguageModelExecutorGenerationChannel.ToolCalls.Action.toolCall(
+            id: id,
+            name: name,
+            action: toolAction
+        )
+        await channel.send(
+            LanguageModelExecutorGenerationChannel.ToolCalls.toolCalls(
+                entryID: entryID,
+                action: action
+            )
+        )
+    }
+
     // MARK: - Final usage
 
     /// Forwards the final token‑usage summary.
