@@ -31,13 +31,6 @@ let package = Package(
                 .enableUpcomingFeature("StrictConcurrency=complete"),
             ],
         ),
-        .executableTarget(
-            name: "Clientest",
-            dependencies: ["LlamaModelExecutor"],
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency=complete"),
-            ],
-        ),
         .testTarget(
             name: "LlamaModelExecutorTests",
             dependencies: ["LlamaModelExecutor"],
