@@ -1,5 +1,5 @@
 # LlamaModelExecutor
-EXPERIMENTAL
+EXPERIMENTAL<p>
 A Swift library that bridges Apple's `FoundationModels` framework (macOS 27+) with a remote [llama.cpp](https://github.com/ggerganov/llama.cpp) server.
 
 Implements the `LanguageModelExecutor` protocol so you can use llama.cpp models through FoundationModels' familiar `LanguageModelSession` API — the same API used by Apple's on-device and Private Cloud Compute models.
