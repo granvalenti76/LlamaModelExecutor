@@ -16,7 +16,7 @@ Implements the `LanguageModelExecutor` protocol so you can use llama.cpp models 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/your-username/LlamaModelExecutor", from: "1.0.0"),
+    .package(url: "https://github.com/granvalenti76/LlamaModelExecutor", from: "1.0.0"),
 ],
 targets: [
     .target(
@@ -61,6 +61,33 @@ let config = LlamaConfiguration(
 )
 ```
 
+## Tool Calling
+
+llama.cpp supports OpenAI-compatible tool/function calling. The library maps FoundationModels'
+`Transcript.ToolDefinition` and `Transcript.ToolCall`/`ToolOutput` entries to the wire format:
+
+```swift
+let request = LanguageModelExecutorGenerationRequest(
+    transcript: transcript,
+    enabledTools: [
+        Transcript.ToolDefinition(
+            name: "get_weather",
+            description: "Get the current weather for a city",
+            parameters: GenerationSchema(
+                type: String.self,
+                description: "city name",
+                properties: []
+            )
+        )
+    ],
+    generationOptions: GenerationOptions(toolCallingMode: .allowed),
+    ...
+)
+```
+
+When the model responds with a tool call, `StreamChunk.ToolCallDelta` events are forwarded
+through the channel as `LanguageModelExecutorGenerationChannel.ToolCalls` events.
+
 ## Architecture
 
 ```
@@ -68,6 +95,10 @@ LanguageModelSession       ← FoundationModels (system framework)
     └── LanguageModel
         └── LlamaModel     ← this library
             └── LlamaExecutor
+                ├── RequestBuilder     → HTTP body
+                ├── SSEStreamParser    ← SSE lines → StreamChunk
+                ├── TokenTracker       ← token accounting
+                ├── ChannelForwarder   → channel events
                 └── HTTPTransport (protocol)
                     ├── URLSessionTransport  ← production
                     └── MockTransport         ← tests
@@ -76,7 +107,7 @@ llama.cpp server           ← remote process (OpenAI-compatible API)
 ```
 
 - `HTTPTransport` is injectable for unit testing. See `Tests/LlamaModelExecutorTests/` for examples with `MockTransport`.
-- Model capabilities are declared honestly — no tool calling, vision, or reasoning advertised by default.
+- Tool calling, streaming, and metadata forwarding are supported out of the box.
 
 ## License
 

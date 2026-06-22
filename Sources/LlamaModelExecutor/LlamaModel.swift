@@ -12,13 +12,12 @@ import FoundationModels
 /// A LanguageModel that wraps a remote llama.cpp server.
 ///
 /// This model communicates with llama-server via its OpenAI-compatible HTTP API.
-/// It supports basic text generation without tool calling, vision, or reasoning.
+/// It supports text generation, streaming, and tool/function calling.
 public struct LlamaModel: LanguageModel, Sendable {
 
     // MARK: - LanguageModel conformance
 
     /// Capabilities advertised by this model.
-    /// Currently empty — no tool calling, vision, or reasoning advertised.
     public var capabilities: LanguageModelCapabilities
 
     /// The configuration used to create this model, surfaced as required by ``LanguageModel``.
@@ -39,6 +38,6 @@ public struct LlamaModel: LanguageModel, Sendable {
     /// - Parameter configuration: Connection and generation parameters.
     public init(configuration: LlamaConfiguration) {
         self.configuration = configuration
-        self.capabilities = LanguageModelCapabilities(capabilities: [])
+        self.capabilities = LanguageModelCapabilities(capabilities: [.toolCalling])
     }
 }
