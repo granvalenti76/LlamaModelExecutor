@@ -38,6 +38,6 @@ public struct LlamaModel: LanguageModel, Sendable {
     /// - Parameter configuration: Connection and generation parameters.
     public init(configuration: LlamaConfiguration) {
         self.configuration = configuration
-        self.capabilities = LanguageModelCapabilities(capabilities: [.toolCalling])
+        self.capabilities = LanguageModelCapabilities([.toolCalling])
     }
 }
