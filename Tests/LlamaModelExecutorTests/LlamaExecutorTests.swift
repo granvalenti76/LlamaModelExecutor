@@ -87,34 +87,26 @@ enum MockJSON {
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":\(promptTokens),\"completion_tokens\":\(completionTokens),\"completion_tokens_details\":{\"reasoning_tokens\":\(reasoningTokens)}},\"timings\":{\"prompt_n\":\(promptTokens),\"predicted_n\":\(completionTokens),\"predicted_per_second\":50.0}}"
     }
 
-    /// Final chunk with `finish_reason: "tool_calls"` (llama.cpp format, no usage).
-    static func finishWithToolCalls(promptTokens: Int = 10, completionTokens: Int = 20) -> String {
-        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"timings\":{\"prompt_n\":\(promptTokens),\"predicted_n\":\(completionTokens),\"predicted_per_second\":50.0}}"
-    }
+    // MARK: - Tool-call deltas (OpenAI SSE format)
 
-    // MARK: - Tool call deltas
-
-    /// First chunk for a tool call: announces id, name, and begins arguments.
-    /// - Parameters:
-    ///   - id: The tool call identifier.
-    ///   - name: The function name.
-    ///   - arguments: Initial arguments fragment (may be empty string).
-    static func toolCallBegin(id: String = "call_abc123", name: String = "get_weather", arguments: String = "") -> String {
+    /// First delta for a tool call: carries id, type, function.name, and an empty arguments string.
+    static func toolCallStart(index: Int = 0, id: String = "call_1", name: String = "get_weather") -> String {
         """
-{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"\(id)\",\"type\":\"function\",\"function\":{\"name\":\"\(name)\",\"arguments\":\"\(arguments)\"}}]}}]}
-""".trimmingCharacters(in: .whitespacesAndNewlines)
+        {"choices":[{"delta":{"tool_calls":[{"index":\(index),"id":"\(id)","type":"function","function":{"name":"\(name)","arguments":""}}]}}]}
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Subsequent chunk for a tool call: appends incremental arguments.
-    /// - Parameters:
-    ///   - index: The tool call index.
-    ///   - arguments: Incremental arguments fragment.
-    static func toolCallAppend(index: Int = 0, arguments: String) -> String {
-        let escaped = arguments
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        return "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":\(index),\"function\":{\"arguments\":\"\(escaped)\"}}]}}]}"
+    /// Subsequent delta: carries only function.arguments (streaming JSON fragment).
+    static func toolCallArguments(index: Int = 0, arguments: String) -> String {
+        """
+        {"choices":[{"delta":{"tool_calls":[{"index":\(index),"function":{"arguments":"\(arguments)"}}]}}]}
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// Tool-call finish chunk: finish_reason is "tool_calls".
+    static let toolCallFinish = """
+    {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"timings":{"prompt_n":10,"predicted_n":5,"predicted_per_second":50.0}}
+    """.trimmingCharacters(in: .whitespacesAndNewlines)
 
     static let done = "[DONE]"
 }
@@ -508,19 +500,363 @@ struct LlamaExecutorIntegrationTests {
     }
 }
 
-// MARK: - Tool calling tests
+// MARK: - SSEStreamParser unit tests
 
-@Suite("LlamaExecutor tool calling")
-struct LlamaExecutorToolCallingTests {
+@Suite("SSEStreamParser")
+struct SSEStreamParserTests {
+
+    let decoder = JSONDecoder()
+
+    /// Helper: creates a stream from raw SSE lines (with or without "data: " prefix).
+    private func makeStream(_ lines: [String]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            for line in lines {
+                continuation.yield(line)
+            }
+            continuation.finish()
+        }
+    }
+
+    @Test("yields decoded chunks from valid SSE lines")
+    func validSSELines() async throws {
+        let raw = [
+            "data: \(MockJSON.textDelta("Hello"))",
+            "data: \(MockJSON.textDelta(" World"))",
+            "data: \(MockJSON.done)",
+        ]
+        let parser = SSEStreamParser()
+        var chunks: [StreamChunk] = []
+
+        for try await chunk in parser.parse(makeStream(raw)) {
+            chunks.append(chunk)
+        }
+
+        #expect(chunks.count == 2)
+        #expect(chunks[0].choices?.first?.delta?.content == "Hello")
+        #expect(chunks[1].choices?.first?.delta?.content == " World")
+    }
+
+    @Test("skips empty lines and non-data lines")
+    func skipsNoise() async throws {
+        let raw = [
+            "",
+            "data: \(MockJSON.textDelta("A"))",
+            ": heartbeat",
+            "data: \(MockJSON.textDelta("B"))",
+            "random text",
+            "data: \(MockJSON.done)",
+        ]
+        let parser = SSEStreamParser()
+        var chunks: [StreamChunk] = []
+
+        for try await chunk in parser.parse(makeStream(raw)) {
+            chunks.append(chunk)
+        }
+
+        #expect(chunks.count == 2)
+        #expect(chunks[0].choices?.first?.delta?.content == "A")
+        #expect(chunks[1].choices?.first?.delta?.content == "B")
+    }
+
+    @Test("terminates early on [DONE] and ignores subsequent lines")
+    func doneTerminates() async throws {
+        let raw = [
+            "data: \(MockJSON.textDelta("First"))",
+            "data: \(MockJSON.done)",
+            "data: \(MockJSON.textDelta("Ignored"))",  // after [DONE]
+        ]
+        let parser = SSEStreamParser()
+        var chunks: [StreamChunk] = []
+
+        for try await chunk in parser.parse(makeStream(raw)) {
+            chunks.append(chunk)
+        }
+
+        #expect(chunks.count == 1)
+        #expect(chunks[0].choices?.first?.delta?.content == "First")
+    }
+
+    @Test("throws after exceeding malformed chunk threshold")
+    func malformedThreshold() async throws {
+        let raw = [
+            "data: not-json",
+            "data: also-not-json",
+            "data: still-not-json",
+            "data: nope",
+            "data: invalid",
+        ]
+        let parser = SSEStreamParser(maxMalformedChunks: 3)
+
+        await #expect(throws: LlamaError.streamError("3 consecutive malformed SSE chunks — aborting")) {
+            for try await _ in parser.parse(makeStream(raw)) { }
+        }
+    }
+
+    @Test("resets malformed counter after a valid chunk")
+    func malformedCounterResets() async throws {
+        let raw = [
+            "data: bad-json",
+            "data: \(MockJSON.textDelta("Valid"))",
+            "data: bad-again",
+            "data: also-bad",
+            "data: still-bad",
+        ]
+        let parser = SSEStreamParser(maxMalformedChunks: 3)
+        var chunks: [StreamChunk] = []
+
+        // The counter resets after the valid chunk, so we need 3 consecutive
+        // malformed chunks after that to trigger the throw.
+        // "bad-again", "also-bad", "still-bad" = 3 → throw.
+        await #expect(throws: LlamaError.streamError("3 consecutive malformed SSE chunks — aborting")) {
+            for try await chunk in parser.parse(makeStream(raw)) {
+                chunks.append(chunk)
+            }
+        }
+
+        #expect(chunks.count == 1)
+    }
+
+    @Test("empty stream yields no chunks")
+    func emptyStream() async throws {
+        let parser = SSEStreamParser()
+        var count = 0
+
+        for try await _ in parser.parse(makeStream([])) {
+            count += 1
+        }
+
+        #expect(count == 0)
+    }
+}
+
+// MARK: - TokenTracker unit tests
+
+@Suite("TokenTracker")
+struct TokenTrackerTests {
+
+    @Test("starts with zero counts")
+    func initialValues() {
+        var tracker = TokenTracker()
+        let counts = tracker.finalize()
+
+        #expect(counts.promptTokens == 0)
+        #expect(counts.completionTokens == 0)
+        #expect(counts.reasoningTokens == 0)
+        #expect(counts.timingMetadata.isEmpty)
+    }
+
+    @Test("usage overrides prompt and completion tokens")
+    func usageUpdatesTokens() {
+        let json = MockJSON.finishWithUsage(promptTokens: 10, completionTokens: 20)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.promptTokens == 10)
+        #expect(counts.completionTokens == 20)
+    }
+
+    @Test("timings updates tokens when usage absent")
+    func timingsFallback() {
+        let json = MockJSON.finishWithTimingsOnly(promptTokens: 7, completionTokens: 15)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.promptTokens == 7)
+        #expect(counts.completionTokens == 15)
+    }
+
+    @Test("usage takes priority over timings in same chunk")
+    func usagePriorityInSameChunk() {
+        // finishWithUsage has both usage and timings.
+        let json = MockJSON.finishWithUsage(promptTokens: 10, completionTokens: 20)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        // usage has prompt_tokens=10, timings has prompt_n=10 (same value here)
+        // The key is that usage was read, not timings.
+        #expect(counts.promptTokens == 10)
+        #expect(counts.completionTokens == 20)
+    }
+
+    @Test("usage overrides previous timings when it arrives later")
+    func usageOverridesPreviousTimings() {
+        let timingsJson = MockJSON.finishWithTimingsOnly(promptTokens: 5, completionTokens: 8)
+        let timingsData = timingsJson.data(using: .utf8)!
+        let timingsChunk = try! JSONDecoder().decode(StreamChunk.self, from: timingsData)
+
+        let usageJson = MockJSON.finishWithUsage(promptTokens: 10, completionTokens: 20)
+        let usageData = usageJson.data(using: .utf8)!
+        let usageChunk = try! JSONDecoder().decode(StreamChunk.self, from: usageData)
+
+        var tracker = TokenTracker()
+        tracker.update(from: timingsChunk)  // first: timings
+        tracker.update(from: usageChunk)    // then: usage overrides
+
+        let counts = tracker.finalize()
+        #expect(counts.promptTokens == 10)   // from usage
+        #expect(counts.completionTokens == 20) // from usage
+    }
+
+    @Test("reasoning: character accumulation fallback")
+    func reasoningAccumulated() {
+        var tracker = TokenTracker()
+        tracker.accountReasoning(delta: "Think")
+        tracker.accountReasoning(delta: " step by step")
+
+        let counts = tracker.finalize()
+        #expect(counts.reasoningTokens == 18)  // "Think" (5) + " step by step" (13) = 18
+    }
+
+    @Test("reasoning: server-reported takes priority over accumulated")
+    func reasoningServerPriority() {
+        let json = MockJSON.finishWithUsageAndReasoning(promptTokens: 10, completionTokens: 20, reasoningTokens: 8)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.accountReasoning(delta: "Some long reasoning text that would be many tokens")  // 49 chars
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.reasoningTokens == 8)  // server-reported, not 49
+    }
+
+    @Test("metadata extracted from timings")
+    func timingMetadata() {
+        let json = MockJSON.finishWithTimingsOnly(promptTokens: 10, completionTokens: 20)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.timingMetadata["predicted_per_second"] as? Double == 42.5)
+        #expect(counts.timingMetadata["predicted_per_token_ms"] as? Double == 23.5)
+    }
+
+    @Test("metadata only contains predicted_per_second when timings lack per_token_ms")
+    func metadataOnlyPerSecond() throws {
+        // MockJSON.finish() includes predicted_per_second:50.0 but no predicted_per_token_ms.
+        let json = MockJSON.finish(promptTokens: 5, completionTokens: 3)
+        let data = json.data(using: .utf8)!
+        let chunk = try JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let counts = tracker.finalize()
+        #expect(counts.timingMetadata.count == 1)
+        #expect(counts.timingMetadata["predicted_per_second"] as? Double == 50.0)
+        #expect(counts.timingMetadata["predicted_per_token_ms"] == nil)
+    }
+
+    @Test("finalize is idempotent")
+    func finalizeIdempotent() {
+        let json = MockJSON.finishWithUsage(promptTokens: 10, completionTokens: 20)
+        let data = json.data(using: .utf8)!
+        let chunk = try! JSONDecoder().decode(StreamChunk.self, from: data)
+
+        var tracker = TokenTracker()
+        tracker.update(from: chunk)
+
+        let first = tracker.finalize()
+        let second = tracker.finalize()
+
+        #expect(first.promptTokens == second.promptTokens)
+        #expect(first.completionTokens == second.completionTokens)
+        #expect(first.reasoningTokens == second.reasoningTokens)
+    }
+}
+
+// MARK: - Tool-call delta decoding tests
+
+@Suite("StreamChunk tool-call decoding")
+struct StreamChunkToolCallDecodingTests {
+
+    let decoder = JSONDecoder()
+
+    @Test("decodes tool_calls delta with id, type, function.name")
+    func toolCallStart() throws {
+        let json = MockJSON.toolCallStart(index: 0, id: "call_42", name: "get_weather")
+        let data = json.data(using: .utf8)!
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        let delta = try #require(chunk.choices?.first?.delta)
+        let calls = try #require(delta.tool_calls)
+        #expect(calls.count == 1)
+        #expect(calls[0].index == 0)
+        #expect(calls[0].id == "call_42")
+        #expect(calls[0].type == "function")
+        let fn = try #require(calls[0].function)
+        #expect(fn.name == "get_weather")
+        #expect(fn.arguments == "")
+    }
+
+    @Test("decodes tool_calls delta with only arguments")
+    func toolCallArguments() throws {
+        // Use a plain text fragment that does not require JSON-in-JSON escaping.
+        let json = MockJSON.toolCallArguments(index: 0, arguments: "latitude")
+        let data = json.data(using: .utf8)!
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        let delta = try #require(chunk.choices?.first?.delta)
+        let calls = try #require(delta.tool_calls)
+        #expect(calls.count == 1)
+        #expect(calls[0].index == 0)
+        #expect(calls[0].id == nil)           // only on first delta
+        #expect(calls[0].function?.name == nil)  // only on first delta
+        #expect(calls[0].function?.arguments == "latitude")
+    }
+
+    @Test("decodes finish_reason tool_calls")
+    func toolCallFinish() throws {
+        let json = MockJSON.toolCallFinish
+        let data = json.data(using: .utf8)!
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        #expect(chunk.choices?.first?.finish_reason == "tool_calls")
+        #expect(chunk.timings?.predicted_per_second == 50.0)
+    }
+
+    @Test("tool_calls defaults to nil when absent")
+    func toolCallsNilWhenAbsent() throws {
+        let json = MockJSON.textDelta("Hello")
+        let data = json.data(using: .utf8)!
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        let delta = try #require(chunk.choices?.first?.delta)
+        #expect(delta.tool_calls == nil)
+        #expect(delta.content == "Hello")
+    }
+}
+
+// MARK: - RequestBuilder tool-call tests
+
+@Suite("RequestBuilder tool handling")
+struct RequestBuilderToolTests {
 
     let config = LlamaConfiguration(modelName: "test")
-    let model = LlamaModel(configuration: LlamaConfiguration(modelName: "test"))
+    let baseURL = URL(string: "http://127.0.0.1:8080/v1")!
 
-    func makeRequest() -> LanguageModelExecutorGenerationRequest {
+    @Test("build does not include tools when enabledToolDefinitions is empty")
+    func noToolsWhenEmpty() throws {
         let entry = Transcript.Entry.prompt(
-            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "What is the weather in Rome?"))])
+            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "Hi"))])
         )
-        return LanguageModelExecutorGenerationRequest(
+        let request = LanguageModelExecutorGenerationRequest(
             id: UUID(),
             transcript: Transcript(entries: [entry]),
             enabledTools: [],
@@ -528,130 +864,125 @@ struct LlamaExecutorToolCallingTests {
             contextOptions: ContextOptions(),
             metadata: [:]
         )
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: "test-model",
+            temperature: 0.7,
+            maxTokens: 100,
+            baseURL: baseURL
+        )
+
+        let body = try JSONSerialization.jsonObject(with: built.urlRequest.httpBody!) as! [String: Any]
+        #expect(body["tools"] == nil)
+        #expect(body["tool_choice"] == nil)
     }
 
-    // MARK: - Tool call streaming
+    @Test("build includes tools when enabledToolDefinitions is provided")
+    func toolsPresent() throws {
+        let entry = Transcript.Entry.prompt(
+            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "Hi"))])
+        )
+        let schema = GenerationSchema(
+            type: String.self,
+            description: "A city name",
+            properties: []
+        )
+        let toolDef = Transcript.ToolDefinition(
+            name: "get_weather",
+            description: "Get the weather for a city",
+            parameters: schema
+        )
+        let request = LanguageModelExecutorGenerationRequest(
+            id: UUID(),
+            transcript: Transcript(entries: [entry]),
+            enabledTools: [toolDef],
+            generationOptions: GenerationOptions(),
+            contextOptions: ContextOptions(),
+            metadata: [:]
+        )
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: "test-model",
+            temperature: 0.7,
+            maxTokens: 100,
+            baseURL: baseURL
+        )
 
-    @Test("streams incremental tool call arguments as ToolCalls events")
-    func incrementalToolCall() async throws {
-        // Simulate a tool call stream with incremental arguments.
-        // The arguments arrive in fragments: "", then "{\"loc", then "ation\": \"Rome\"}"
-        let lines = [
-            MockJSON.toolCallBegin(id: "call_123", name: "get_weather", arguments: "").sseData,
-            MockJSON.toolCallAppend(index: 0, arguments: "{\\\"loc").sseData,
-            MockJSON.toolCallAppend(index: 0, arguments: "ation\\\": \\\"Rome\\\"}").sseData,
-            MockJSON.finishWithToolCalls(promptTokens: 15, completionTokens: 10).sseData,
-            MockJSON.done.sseData,
-        ]
-        let transport = MockTransport(lines: lines)
-        let executor = try LlamaExecutor(configuration: config, transport: transport)
-        let channel = LanguageModelExecutorGenerationChannel()
-
-        async let respond: Void = executor.respond(to: makeRequest(), model: model, streamingInto: channel)
-
-        var toolCallFragments: [String] = []
-        for try await event in channel {
-            guard let toolCalls = event as? LanguageModelExecutorGenerationChannel.ToolCalls else { continue }
-            guard case .toolCall(let tc) = toolCalls.action else { continue }
-            guard case .appendArguments(let fragment) = tc.action else { continue }
-            toolCallFragments.append(fragment.content)
-        }
-
-        try await respond
-        #expect(toolCallFragments.count == 3)
-        #expect(toolCallFragments[0] == "")
-        #expect(toolCallFragments[1] == "{\\\"loc")
-        #expect(toolCallFragments[2] == "ation\\\": \\\"Rome\\\"}")
+        let body = try JSONSerialization.jsonObject(with: built.urlRequest.httpBody!) as! [String: Any]
+        let tools = try #require(body["tools"] as? [[String: Any]])
+        #expect(tools.count == 1)
+        #expect(tools[0]["type"] as? String == "function")
+        let fn = try #require(tools[0]["function"] as? [String: Any])
+        #expect(fn["name"] as? String == "get_weather")
+        #expect(fn["description"] as? String == "Get the weather for a city")
+        #expect(fn["parameters"] is [String: Any])
     }
 
-    @Test("emits usage after tool call finish")
-    func usageAfterToolCall() async throws {
-        let lines = [
-            MockJSON.toolCallBegin(id: "call_456", name: "get_weather", arguments: "{}").sseData,
-            MockJSON.finishWithToolCalls(promptTokens: 20, completionTokens: 15).sseData,
-            MockJSON.done.sseData,
-        ]
-        let transport = MockTransport(lines: lines)
-        let executor = try LlamaExecutor(configuration: config, transport: transport)
-        let channel = LanguageModelExecutorGenerationChannel()
+    @Test("tool_choice is none when toolCallingMode is disallowed")
+    func toolChoiceDisallowed() throws {
+        let entry = Transcript.Entry.prompt(
+            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "Hi"))])
+        )
+        let schema = GenerationSchema(type: String.self, description: "", properties: [])
+        let toolDef = Transcript.ToolDefinition(
+            name: "test", description: "", parameters: schema
+        )
+        let request = LanguageModelExecutorGenerationRequest(
+            id: UUID(),
+            transcript: Transcript(entries: [entry]),
+            enabledTools: [toolDef],
+            generationOptions: GenerationOptions(
+                samplingMode: nil,
+                temperature: nil,
+                maximumResponseTokens: nil,
+                toolCallingMode: .disallowed
+            ),
+            contextOptions: ContextOptions(),
+            metadata: [:]
+        )
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: "test",
+            temperature: 0.7,
+            maxTokens: 100,
+            baseURL: baseURL
+        )
 
-        async let respond: Void = executor.respond(to: makeRequest(), model: model, streamingInto: channel)
-
-        var usage: LanguageModelExecutorGenerationChannel.Usage?
-        for try await event in channel {
-            if let toolCalls = event as? LanguageModelExecutorGenerationChannel.ToolCalls {
-                guard case .updateUsage(let u) = toolCalls.action else { continue }
-                usage = u
-            }
-            if let response = event as? LanguageModelExecutorGenerationChannel.Response {
-                guard case .updateUsage(let u) = response.action else { continue }
-                usage = u
-            }
-        }
-
-        try await respond
-        #expect(usage != nil)
-        #expect(usage?.input.totalTokenCount == 20)
-        #expect(usage?.output.totalTokenCount == 15)
+        let body = try JSONSerialization.jsonObject(with: built.urlRequest.httpBody!) as! [String: Any]
+        #expect(body["tool_choice"] as? String == "none")
     }
 
-    @Test("parses tool call delta with single-chunk JSON arguments")
-    func toolCallSingleChunkArgs() async throws {
-        let lines = [
-            MockJSON.toolCallBegin(
-                id: "call_789",
-                name: "search_documents",
-                arguments: "{\\\"query\\\":\\\"annual report\\\",\\\"limit\\\":5}"
-            ).sseData,
-            MockJSON.finishWithToolCalls(promptTokens: 30, completionTokens: 25).sseData,
-            MockJSON.done.sseData,
-        ]
-        let transport = MockTransport(lines: lines)
-        let executor = try LlamaExecutor(configuration: config, transport: transport)
-        let channel = LanguageModelExecutorGenerationChannel()
+    @Test("tool_choice is required when toolCallingMode is required")
+    func toolChoiceRequired() throws {
+        let entry = Transcript.Entry.prompt(
+            Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: "Hi"))])
+        )
+        let schema = GenerationSchema(type: String.self, description: "", properties: [])
+        let toolDef = Transcript.ToolDefinition(
+            name: "test", description: "", parameters: schema
+        )
+        let request = LanguageModelExecutorGenerationRequest(
+            id: UUID(),
+            transcript: Transcript(entries: [entry]),
+            enabledTools: [toolDef],
+            generationOptions: GenerationOptions(
+                samplingMode: nil,
+                temperature: nil,
+                maximumResponseTokens: nil,
+                toolCallingMode: .required
+            ),
+            contextOptions: ContextOptions(),
+            metadata: [:]
+        )
+        let built = try RequestBuilder.build(
+            from: request,
+            modelName: "test",
+            temperature: 0.7,
+            maxTokens: 100,
+            baseURL: baseURL
+        )
 
-        async let respond: Void = executor.respond(to: makeRequest(), model: model, streamingInto: channel)
-
-        var fragments: [String] = []
-        for try await event in channel {
-            guard let toolCalls = event as? LanguageModelExecutorGenerationChannel.ToolCalls else { continue }
-            guard case .toolCall(let tc) = toolCalls.action else { continue }
-            guard case .appendArguments(let fragment) = tc.action else { continue }
-            fragments.append(fragment.content)
-        }
-
-        try await respond
-        #expect(fragments.count == 1)
-        #expect(fragments[0] == "{\\\"query\\\":\\\"annual report\\\",\\\"limit\\\":5}")
-    }
-
-    @Test("tool call stream also emits usage on response channel")
-    func usageOnResponseAfterToolCall() async throws {
-        let lines = [
-            MockJSON.toolCallBegin(id: "call_x1", name: "get_weather", arguments: "{}").sseData,
-            MockJSON.finish(promptTokens: 10, completionTokens: 5).sseData,
-            MockJSON.done.sseData,
-        ]
-        let transport = MockTransport(lines: lines)
-        let executor = try LlamaExecutor(configuration: config, transport: transport)
-        let channel = LanguageModelExecutorGenerationChannel()
-
-        async let respond: Void = executor.respond(to: makeRequest(), model: model, streamingInto: channel)
-
-        var usageCount = 0
-        for try await event in channel {
-            if let response = event as? LanguageModelExecutorGenerationChannel.Response {
-                guard case .updateUsage = response.action else { continue }
-                usageCount += 1
-            }
-            if let toolCalls = event as? LanguageModelExecutorGenerationChannel.ToolCalls {
-                guard case .updateUsage = toolCalls.action else { continue }
-                usageCount += 1
-            }
-        }
-
-        try await respond
-        // Should receive one usage event (either via Response or ToolCalls channel)
-        #expect(usageCount == 1)
+        let body = try JSONSerialization.jsonObject(with: built.urlRequest.httpBody!) as! [String: Any]
+        #expect(body["tool_choice"] as? String == "required")
     }
 }

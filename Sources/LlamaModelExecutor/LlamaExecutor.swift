@@ -20,7 +20,6 @@ public struct LlamaExecutor: LanguageModelExecutor {
 
     private let configuration: Configuration
     private let transport: HTTPTransport
-    private let decoder: JSONDecoder
 
     /// Creates an executor with a custom transport.
     /// - Parameter configuration: Connection and generation parameters.
@@ -28,7 +27,6 @@ public struct LlamaExecutor: LanguageModelExecutor {
     public init(configuration: Configuration, transport: HTTPTransport) throws {
         self.configuration = configuration
         self.transport = transport
-        self.decoder = JSONDecoder()
     }
 
     /// Creates an executor backed by the default ``URLSessionTransport``.
@@ -40,7 +38,6 @@ public struct LlamaExecutor: LanguageModelExecutor {
         let session = URLSession(configuration: sessionConfig)
         self.configuration = configuration
         self.transport = URLSessionTransport(session: session)
-        self.decoder = JSONDecoder()
     }
 
     // MARK: - prewarm
@@ -62,189 +59,91 @@ public struct LlamaExecutor: LanguageModelExecutor {
         model: LlamaModel,
         streamingInto channel: LanguageModelExecutorGenerationChannel
     ) async throws {
-        // 1. Build the HTTP request via RequestBuilder
+        // 1. Resolve effective temperature from sampling mode.
+        //    Greedy sampling is approximated by forcing temperature to 0.
+        let effectiveTemperature: Double
+        if request.generationOptions.samplingMode == .greedy {
+            effectiveTemperature = 0
+        } else {
+            effectiveTemperature = configuration.temperature
+        }
+
+        // 2. Build the HTTP request via RequestBuilder.
         let built = try RequestBuilder.build(
             from: request,
             modelName: configuration.modelName,
-            temperature: configuration.temperature,
+            temperature: effectiveTemperature,
             maxTokens: configuration.maxTokens,
             baseURL: configuration.baseURL
         )
 
-        // 2. Perform streaming request
+        // 3. Execute the streaming request.
         let (lines, response) = try await transport.lines(for: built.urlRequest)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw LlamaError.invalidResponse
         }
-
         guard (200...299).contains(httpResponse.statusCode) else {
             throw LlamaError.httpError(statusCode: httpResponse.statusCode)
         }
 
-        // 3. Parse SSE stream
-        var promptTokens = 0
-        var completionTokens = 0
-        var reasoningTokens = 0
-        var lastTimings: StreamChunk.Timings?
-        var malformedChunkCount = 0
-        let maxMalformedChunks = 5
+        // 4. Parse the SSE stream, tracking tokens and forwarding events.
+        let parser = SSEStreamParser()
+        var tracker = TokenTracker()
+        let forwarder = ChannelForwarder(channel: channel, entryID: request.id.uuidString)
 
-        // Track in-flight tool calls: [toolCallId: toolName]
-        var toolCallNames: [String: String] = [:]
+        // Track active tool calls by stream index so we can correlate
+        // arguments fragments with their id/name (sent only on the first delta).
+        var activeToolCalls: [Int: (id: String, name: String)] = [:]
 
-        for try await line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        for try await chunk in parser.parse(lines) {
+            tracker.update(from: chunk)
 
-            guard !trimmed.isEmpty else { continue }
-            guard trimmed.hasPrefix("data: ") else { continue }
-            let payload = String(trimmed.dropFirst(6))
+            if let choice = chunk.choices?.first {
+                // Reasoning-content delta.
+                if let reasoning = choice.delta?.reasoning_content, !reasoning.isEmpty {
+                    tracker.accountReasoning(delta: reasoning)
+                    await forwarder.sendReasoning(text: reasoning, tokenCount: reasoning.count)
+                }
 
-            guard payload != "[DONE]" else { break }
-            guard let jsonData = payload.data(using: .utf8) else { continue }
+                // Response-text delta.
+                if let content = choice.delta?.content, !content.isEmpty {
+                    await forwarder.sendResponse(text: content, tokenCount: content.count)
+                }
 
-            do {
-                let chunk = try decoder.decode(StreamChunk.self, from: jsonData)
+                // Tool-call delta — the model is requesting a tool invocation.
+                if let toolCallDeltas = choice.delta?.tool_calls {
+                    for delta in toolCallDeltas {
+                        // Correlate id/name from the first delta or reuse tracked values.
+                        let callID = delta.id ?? activeToolCalls[delta.index]?.id ?? ""
+                        let callName = delta.function?.name ?? activeToolCalls[delta.index]?.name ?? ""
 
-                if let choice = chunk.choices?.first {
-                    // Reasoning content: forward delta events and accumulate token count.
-                    // llama.cpp does not report completion_tokens_details.reasoning_tokens,
-                    // so we estimate reasoning tokens from the character count of each delta.
-                    if let reasoning = choice.delta?.reasoning_content, !reasoning.isEmpty {
-                        reasoningTokens += reasoning.count
-                        let action = LanguageModelExecutorGenerationChannel.Reasoning.Action.appendText(
-                            reasoning,
-                            segmentID: nil,
-                            tokenCount: reasoning.count
-                        )
-                        await channel.send(
-                            LanguageModelExecutorGenerationChannel.Reasoning.reasoning(
-                                entryID: request.id.uuidString,
-                                action: action
-                            )
-                        )
-                    }
-
-                    // Response text (only when no tool_calls are present, or when content is non-nil)
-                    if let content = choice.delta?.content, !content.isEmpty {
-                        let action = LanguageModelExecutorGenerationChannel.Response.Action.appendText(
-                            content,
-                            segmentID: nil,
-                            tokenCount: content.count
-                        )
-                        await channel.send(
-                            LanguageModelExecutorGenerationChannel.Response.response(
-                                entryID: request.id.uuidString,
-                                action: action
-                            )
-                        )
-                    }
-
-                    // Tool call deltas: forward as ToolCalls channel events
-                    if let toolCallDeltas = choice.delta?.tool_calls {
-                        for toolDelta in toolCallDeltas {
-                            // First chunk carries id + name; subsequent only arguments
-                            if let callId = toolDelta.id, let functionName = toolDelta.function?.name {
-                                toolCallNames[callId] = functionName
-                                let argsContent = toolDelta.function?.arguments ?? ""
-                                let action = LanguageModelExecutorGenerationChannel.ToolCalls.Action.toolCall(
-                                    id: callId,
-                                    name: functionName,
-                                    action: .appendArguments(argsContent, tokenCount: argsContent.count)
-                                )
-                                await channel.send(
-                                    LanguageModelExecutorGenerationChannel.ToolCalls.toolCalls(
-                                        entryID: request.id.uuidString,
-                                        action: action
-                                    )
-                                )
-                            } else if let argsContent = toolDelta.function?.arguments, !argsContent.isEmpty {
-                                // Subsequent chunk for an existing tool call; find its name by index.
-                                // We use a simple heuristic: if there is only one in-flight tool call,
-                                // we use that name. Otherwise we derive it from the function name
-                                // stored during the first occurrence.
-                                if toolCallNames.count == 1 {
-                                    let (callId, functionName) = toolCallNames.first!
-                                    let action = LanguageModelExecutorGenerationChannel.ToolCalls.Action.toolCall(
-                                        id: callId,
-                                        name: functionName,
-                                        action: .appendArguments(argsContent, tokenCount: argsContent.count)
-                                    )
-                                    await channel.send(
-                                        LanguageModelExecutorGenerationChannel.ToolCalls.toolCalls(
-                                            entryID: request.id.uuidString,
-                                            action: action
-                                        )
-                                    )
-                                }
-                                // When multiple tool calls are in flight and we lack the id,
-                                // we cannot reliably route the delta. This is a known limitation
-                                // of the delta-only format when parallel tool calls are used.
-                            }
+                        if activeToolCalls[delta.index] == nil {
+                            activeToolCalls[delta.index] = (id: callID, name: callName)
                         }
-                    }
 
-                    // Token counts from the standard OpenAI usage payload.
-                    if let usage = chunk.usage {
-                        promptTokens = usage.prompt_tokens ?? 0
-                        completionTokens = usage.completion_tokens ?? 0
-                        // Prefer server-reported reasoning tokens when available.
-                        // Otherwise reasoningTokens is already accumulated from reasoning_content deltas.
-                        if let serverReasoning = usage.completion_tokens_details?.reasoning_tokens {
-                            reasoningTokens = serverReasoning
+                        if let args = delta.function?.arguments, !args.isEmpty {
+                            await forwarder.sendToolCall(
+                                id: callID,
+                                name: callName,
+                                fragment: args,
+                                tokenCount: args.count
+                            )
                         }
                     }
                 }
-
-                // llama.cpp sends token counts via the timings field (not usage).
-                if let timings = chunk.timings, chunk.usage == nil {
-                    promptTokens = timings.prompt_n ?? 0
-                    completionTokens = timings.predicted_n ?? 0
-                }
-
-                // Capture timing metadata regardless (predicted_per_second, etc.).
-                if let timings = chunk.timings {
-                    lastTimings = timings
-                }
-            } catch {
-                malformedChunkCount += 1
-                if malformedChunkCount >= maxMalformedChunks {
-                    throw LlamaError.streamError(
-                        "\(malformedChunkCount) consecutive malformed SSE chunks — aborting"
-                    )
-                }
-                continue
             }
         }
 
-        // 4. Forward timing metadata (predicted_per_second, etc.) as response metadata.
-        if let timings = lastTimings {
-            var metadata: [String: any Sendable & Codable & Equatable] = [:]
-            if let perSecond = timings.predicted_per_second {
-                metadata["predicted_per_second"] = perSecond
-            }
-            if let perTokenMs = timings.predicted_per_token_ms {
-                metadata["predicted_per_token_ms"] = perTokenMs
-            }
-            if !metadata.isEmpty {
-                await channel.send(
-                    LanguageModelExecutorGenerationChannel.Response.response(
-                        entryID: request.id.uuidString,
-                        action: .updateMetadata(metadata)
-                    )
-                )
-            }
+        // 5. Forward timing metadata and final usage.
+        let counts = tracker.finalize()
+        if !counts.timingMetadata.isEmpty {
+            await forwarder.sendMetadata(counts.timingMetadata)
         }
-
-        // 5. Send final usage update with reasoning token count.
-        await channel.send(
-            LanguageModelExecutorGenerationChannel.Response.response(
-                entryID: request.id.uuidString,
-                action: .updateUsage(
-                    input: .init(totalTokenCount: promptTokens, cachedTokenCount: 0),
-                    output: .init(totalTokenCount: completionTokens, reasoningTokenCount: reasoningTokens)
-                )
-            )
+        await forwarder.sendFinalUsage(
+            promptTokens: counts.promptTokens,
+            completionTokens: counts.completionTokens,
+            reasoningTokens: counts.reasoningTokens
         )
     }
 }

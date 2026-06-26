@@ -49,19 +49,18 @@ package enum RequestBuilder {
             "max_tokens": resolvedMaxTokens,
         ]
 
-        // Tool definitions (if any)
+        // Include tool definitions and tool_choice when tools are registered.
         if !request.enabledToolDefinitions.isEmpty {
-            body["tools"] = buildToolDefinitions(request.enabledToolDefinitions)
+            body["tools"] = try convertToolDefinitions(request.enabledToolDefinitions)
 
-            // Map FoundationModels tool calling mode to OpenAI tool_choice
-            if let toolCallingMode = request.generationOptions.toolCallingMode {
-                switch toolCallingMode.kind {
-                case .allowed:
-                    body["tool_choice"] = "auto"
+            if let mode = request.generationOptions.toolCallingMode {
+                switch mode.kind {
                 case .required:
                     body["tool_choice"] = "required"
                 case .disallowed:
                     body["tool_choice"] = "none"
+                case .allowed:
+                    break  // let the model decide (default behaviour)
                 @unknown default:
                     break
                 }
@@ -99,16 +98,31 @@ package enum RequestBuilder {
                 messages.append(["role": "assistant", "content": text])
 
             case .toolCalls(let toolCalls):
-                messages.append(buildAssistantWithToolCalls(toolCalls))
-
-            case .toolOutput(let toolOutput):
-                let text = extractText(from: toolOutput.segments)
+                let toolCallDicts: [[String: Any]] = toolCalls.map { call in
+                    // GeneratedContent is not Encodable, but its description
+                    // yields valid JSON for previously-emitted tool calls.
+                    let argsJSON = String(describing: call.arguments)
+                    return [
+                        "id": call.id,
+                        "type": "function",
+                        "function": [
+                            "name": call.toolName,
+                            "arguments": argsJSON,
+                        ],
+                    ]
+                }
                 messages.append([
-                    "role": "tool",
-                    "tool_call_id": toolOutput.id,
-                    "content": text,
+                    "role": "assistant",
+                    "tool_calls": toolCallDicts,
                 ])
 
+            case .toolOutput(let output):
+                let text = extractText(from: output.segments)
+                messages.append([
+                    "role": "tool",
+                    "tool_call_id": output.id,
+                    "content": text,
+                ])
             case .reasoning:
                 // llama.cpp does not support reasoning in message history;
                 // we skip reasoning transcript entries.
@@ -122,42 +136,21 @@ package enum RequestBuilder {
         return messages
     }
 
-    /// Build an assistant message with `tool_calls` from transcript tool call entries.
-    private static func buildAssistantWithToolCalls(_ toolCalls: Transcript.ToolCalls) -> [String: Any] {
-        let calls: [[String: Any]] = toolCalls.map { call in
-            [
-                "id": call.id,
-                "type": "function",
-                "function": [
-                    "name": call.toolName,
-                    "arguments": call.arguments.jsonString,
-                ],
-            ]
-        }
-        return [
-            "role": "assistant",
-            "tool_calls": calls,
-        ]
-    }
-
-    /// Build the OpenAI `tools` array from FoundationModels tool definitions.
-    private static func buildToolDefinitions(_ definitions: [Transcript.ToolDefinition]) -> [[String: Any]] {
+    /// Convert FoundationModels tool definitions into the OpenAI `tools` array format.
+    private static func convertToolDefinitions(
+        _ tools: [Transcript.ToolDefinition]
+    ) throws -> [[String: Any]] {
         let encoder = JSONEncoder()
-        return definitions.map { def in
-            let parametersDict: [String: Any]
-            do {
-                let data = try encoder.encode(def.parameters)
-                parametersDict = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            } catch {
-                // If schema encoding fails, send a minimal object schema
-                parametersDict = ["type": "object"]
-            }
+        return try tools.map { tool in
+            let paramsData = try encoder.encode(tool.parameters)
+            let paramsJSON = try JSONSerialization.jsonObject(with: paramsData)
+                as? [String: Any] ?? [:]
             return [
                 "type": "function",
                 "function": [
-                    "name": def.name,
-                    "description": def.description,
-                    "parameters": parametersDict,
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": paramsJSON,
                 ],
             ]
         }

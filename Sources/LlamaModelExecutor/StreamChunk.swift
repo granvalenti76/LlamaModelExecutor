@@ -23,33 +23,36 @@ package struct StreamChunk: Decodable, Sendable {
             public let content: String?
             /// Reasoning-content delta emitted by reasoning-capable models (e.g. Gemma).
             public let reasoning_content: String?
-            /// Tool call deltas, each describing one function call being streamed.
-            /// Present only when the model decides to invoke a tool.
+            /// Tool-call deltas emitted when the model invokes a tool.
+            /// Each element is a fragment of a tool call that gets streamed
+            /// across multiple chunks (id/name on the first, arguments in subsequent).
             public let tool_calls: [ToolCallDelta]?
         }
         public let delta: Delta?
+        /// The reason the model stopped generating.
+        /// When `"tool_calls"`, the model is requesting a tool invocation.
         public let finish_reason: String?
     }
 
-    /// A single tool call delta within an SSE chunk.
+    /// A fragment of a streaming tool-call delta in OpenAI SSE format.
     ///
-    /// On the first chunk for a given `index` the server sends `id` and
-    /// `function.name`. Subsequent chunks for the same `index` only contain
-    /// `function.arguments` which is streamed incrementally.
+    /// The first chunk for a tool call carries `id` and `function.name`;
+    /// subsequent chunks append `function.arguments` as a JSON fragment.
     package struct ToolCallDelta: Decodable, Sendable {
-        /// The index of this tool call among multiple parallel calls.
-        public let index: Int?
-        /// The unique identifier for this tool call (present only on the first chunk).
+        /// The index of this tool call (used to correlate fragments across chunks).
+        public let index: Int
+        /// The unique identifier for this tool call (present only on the first delta).
         public let id: String?
-        /// The type of tool call; always "function" for OpenAI-compatible APIs.
+        /// The type of tool (always `"function"` for OpenAI-compatible APIs).
         public let type: String?
-        /// The function details.
+        /// The function details: name on first delta, arguments as streaming JSON.
         public let function: FunctionDelta?
 
+        /// Function-specific fields in a tool-call delta.
         package struct FunctionDelta: Decodable, Sendable {
-            /// The name of the function being called (present only on the first chunk).
+            /// The name of the function to call (present only on the first delta).
             public let name: String?
-            /// A JSON fragment of the function arguments, streamed incrementally.
+            /// A streaming fragment of the JSON arguments.
             public let arguments: String?
         }
     }

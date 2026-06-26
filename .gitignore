@@ -8,4 +8,5 @@ DerivedData/
 .netrc
 AGENTS.md
 .ai-context.md
-.swiftpm
+/Sources/Clientest
+/.swiftpm
