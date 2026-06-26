@@ -41,13 +41,32 @@ package enum RequestBuilder {
         let resolvedTemperature = request.generationOptions.temperature ?? temperature
         let resolvedMaxTokens = request.generationOptions.maximumResponseTokens ?? maxTokens
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": modelName,
             "messages": messages,
             "stream": true,
             "temperature": resolvedTemperature,
             "max_tokens": resolvedMaxTokens,
         ]
+
+        // Tool definitions (if any)
+        if !request.enabledToolDefinitions.isEmpty {
+            body["tools"] = buildToolDefinitions(request.enabledToolDefinitions)
+
+            // Map FoundationModels tool calling mode to OpenAI tool_choice
+            if let toolCallingMode = request.generationOptions.toolCallingMode {
+                switch toolCallingMode.kind {
+                case .allowed:
+                    body["tool_choice"] = "auto"
+                case .required:
+                    body["tool_choice"] = "required"
+                case .disallowed:
+                    body["tool_choice"] = "none"
+                @unknown default:
+                    break
+                }
+            }
+        }
 
         var urlRequest = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
         urlRequest.httpMethod = "POST"
@@ -79,18 +98,69 @@ package enum RequestBuilder {
                 let text = extractText(from: response.segments)
                 messages.append(["role": "assistant", "content": text])
 
-            case .toolCalls:
-                break
-            case .toolOutput:
-                break
+            case .toolCalls(let toolCalls):
+                messages.append(buildAssistantWithToolCalls(toolCalls))
+
+            case .toolOutput(let toolOutput):
+                let text = extractText(from: toolOutput.segments)
+                messages.append([
+                    "role": "tool",
+                    "tool_call_id": toolOutput.id,
+                    "content": text,
+                ])
+
             case .reasoning:
+                // llama.cpp does not support reasoning in message history;
+                // we skip reasoning transcript entries.
                 break
+
             @unknown default:
                 break
             }
         }
 
         return messages
+    }
+
+    /// Build an assistant message with `tool_calls` from transcript tool call entries.
+    private static func buildAssistantWithToolCalls(_ toolCalls: Transcript.ToolCalls) -> [String: Any] {
+        let calls: [[String: Any]] = toolCalls.map { call in
+            [
+                "id": call.id,
+                "type": "function",
+                "function": [
+                    "name": call.toolName,
+                    "arguments": call.arguments.jsonString,
+                ],
+            ]
+        }
+        return [
+            "role": "assistant",
+            "tool_calls": calls,
+        ]
+    }
+
+    /// Build the OpenAI `tools` array from FoundationModels tool definitions.
+    private static func buildToolDefinitions(_ definitions: [Transcript.ToolDefinition]) -> [[String: Any]] {
+        let encoder = JSONEncoder()
+        return definitions.map { def in
+            let parametersDict: [String: Any]
+            do {
+                let data = try encoder.encode(def.parameters)
+                parametersDict = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            } catch {
+                // If schema encoding fails, send a minimal object schema
+                parametersDict = ["type": "object"]
+            }
+            return [
+                "type": "function",
+                "function": [
+                    "name": def.name,
+                    "description": def.description,
+                    "parameters": parametersDict,
+                ],
+            ]
+        }
     }
 
     /// Extract plain text from an array of transcript segments.

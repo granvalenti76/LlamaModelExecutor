@@ -90,6 +90,9 @@ public struct LlamaExecutor: LanguageModelExecutor {
         var malformedChunkCount = 0
         let maxMalformedChunks = 5
 
+        // Track in-flight tool calls: [toolCallId: toolName]
+        var toolCallNames: [String: String] = [:]
+
         for try await line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -122,7 +125,7 @@ public struct LlamaExecutor: LanguageModelExecutor {
                         )
                     }
 
-                    // Response text
+                    // Response text (only when no tool_calls are present, or when content is non-nil)
                     if let content = choice.delta?.content, !content.isEmpty {
                         let action = LanguageModelExecutorGenerationChannel.Response.Action.appendText(
                             content,
@@ -135,6 +138,50 @@ public struct LlamaExecutor: LanguageModelExecutor {
                                 action: action
                             )
                         )
+                    }
+
+                    // Tool call deltas: forward as ToolCalls channel events
+                    if let toolCallDeltas = choice.delta?.tool_calls {
+                        for toolDelta in toolCallDeltas {
+                            // First chunk carries id + name; subsequent only arguments
+                            if let callId = toolDelta.id, let functionName = toolDelta.function?.name {
+                                toolCallNames[callId] = functionName
+                                let argsContent = toolDelta.function?.arguments ?? ""
+                                let action = LanguageModelExecutorGenerationChannel.ToolCalls.Action.toolCall(
+                                    id: callId,
+                                    name: functionName,
+                                    action: .appendArguments(argsContent, tokenCount: argsContent.count)
+                                )
+                                await channel.send(
+                                    LanguageModelExecutorGenerationChannel.ToolCalls.toolCalls(
+                                        entryID: request.id.uuidString,
+                                        action: action
+                                    )
+                                )
+                            } else if let argsContent = toolDelta.function?.arguments, !argsContent.isEmpty {
+                                // Subsequent chunk for an existing tool call; find its name by index.
+                                // We use a simple heuristic: if there is only one in-flight tool call,
+                                // we use that name. Otherwise we derive it from the function name
+                                // stored during the first occurrence.
+                                if toolCallNames.count == 1 {
+                                    let (callId, functionName) = toolCallNames.first!
+                                    let action = LanguageModelExecutorGenerationChannel.ToolCalls.Action.toolCall(
+                                        id: callId,
+                                        name: functionName,
+                                        action: .appendArguments(argsContent, tokenCount: argsContent.count)
+                                    )
+                                    await channel.send(
+                                        LanguageModelExecutorGenerationChannel.ToolCalls.toolCalls(
+                                            entryID: request.id.uuidString,
+                                            action: action
+                                        )
+                                    )
+                                }
+                                // When multiple tool calls are in flight and we lack the id,
+                                // we cannot reliably route the delta. This is a known limitation
+                                // of the delta-only format when parallel tool calls are used.
+                            }
+                        }
                     }
 
                     // Token counts from the standard OpenAI usage payload.

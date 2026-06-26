@@ -23,9 +23,35 @@ package struct StreamChunk: Decodable, Sendable {
             public let content: String?
             /// Reasoning-content delta emitted by reasoning-capable models (e.g. Gemma).
             public let reasoning_content: String?
+            /// Tool call deltas, each describing one function call being streamed.
+            /// Present only when the model decides to invoke a tool.
+            public let tool_calls: [ToolCallDelta]?
         }
         public let delta: Delta?
         public let finish_reason: String?
+    }
+
+    /// A single tool call delta within an SSE chunk.
+    ///
+    /// On the first chunk for a given `index` the server sends `id` and
+    /// `function.name`. Subsequent chunks for the same `index` only contain
+    /// `function.arguments` which is streamed incrementally.
+    package struct ToolCallDelta: Decodable, Sendable {
+        /// The index of this tool call among multiple parallel calls.
+        public let index: Int?
+        /// The unique identifier for this tool call (present only on the first chunk).
+        public let id: String?
+        /// The type of tool call; always "function" for OpenAI-compatible APIs.
+        public let type: String?
+        /// The function details.
+        public let function: FunctionDelta?
+
+        package struct FunctionDelta: Decodable, Sendable {
+            /// The name of the function being called (present only on the first chunk).
+            public let name: String?
+            /// A JSON fragment of the function arguments, streamed incrementally.
+            public let arguments: String?
+        }
     }
 
     /// Standard OpenAI usage payload (usually present on the last streaming chunk,
