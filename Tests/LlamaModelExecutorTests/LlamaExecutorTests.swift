@@ -55,6 +55,7 @@ struct MockTransport: HTTPTransport {
 /// - Final chunk has `timings` at top level, **no** `usage` object
 /// - Reasoning models emit `reasoning_content` deltas before `content`
 /// - `timings` includes `predicted_per_second`, `predicted_per_token_ms`
+/// - Tool call chunks follow OpenAI streaming delta format
 enum MockJSON {
     static func textDelta(_ text: String) -> String {
         "{\"choices\":[{\"delta\":{\"content\":\"\(text)\"}}]}"
@@ -219,6 +220,38 @@ struct StreamChunkDecodingTests {
         #expect(chunk.timings?.predicted_per_token_ms == nil)
         #expect(chunk.usage == nil)  // llama.cpp format
     }
+
+    @Test("decodes tool_calls in delta")
+    func toolCallDelta() throws {
+        let json = MockJSON.toolCallBegin(id: "call_1", name: "get_weather", arguments: "{}")
+        let data = json.data(using: .utf8)!
+        let decoder = JSONDecoder()
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        let toolCalls = chunk.choices?.first?.delta?.tool_calls
+        #expect(toolCalls != nil)
+        #expect(toolCalls?.count == 1)
+        #expect(toolCalls?.first?.id == "call_1")
+        #expect(toolCalls?.first?.function?.name == "get_weather")
+        #expect(toolCalls?.first?.function?.arguments == "{}")
+        #expect(toolCalls?.first?.type == "function")
+    }
+
+    @Test("decodes incremental tool call append")
+    func toolCallAppendDelta() throws {
+        let json = MockJSON.toolCallAppend(index: 0, arguments: "{\\\"loc")
+        let data = json.data(using: .utf8)!
+        let decoder = JSONDecoder()
+        let chunk = try decoder.decode(StreamChunk.self, from: data)
+
+        let toolCalls = chunk.choices?.first?.delta?.tool_calls
+        #expect(toolCalls != nil)
+        #expect(toolCalls?.count == 1)
+        #expect(toolCalls?.first?.index == 0)
+        #expect(toolCalls?.first?.id == nil)  // not present on append
+        #expect(toolCalls?.first?.function?.name == nil)  // not present on append
+        #expect(toolCalls?.first?.function?.arguments == "{\\\"loc")
+    }
 }
 
 // MARK: - Integration tests (require concurrent channel consumer)
@@ -280,7 +313,7 @@ struct LlamaExecutorIntegrationTests {
 
     @Test("accumulates reasoning tokens from reasoning_content deltas")
     func reasoningTokensAccumulated() async throws {
-        // Reasoning deltas totaling 15 characters → reasoningTokens should be 15
+        // Reasoning deltas totaling 15 characters -> reasoningTokens should be 15
         let lines = [
             MockJSON.reasoningDelta("Think step ").sseData,
             MockJSON.reasoningDelta("by step...").sseData,
@@ -335,7 +368,7 @@ struct LlamaExecutorIntegrationTests {
 
     @Test("prefers server-reported reasoning tokens over accumulated count")
     func reasoningTokensPreferredFromServer() async throws {
-        // Accumulated: "Think" (5 chars), but server says 10 → should use 10.
+        // Accumulated: "Think" (5 chars), but server says 10 -> should use 10.
         let lines = [
             MockJSON.reasoningDelta("Think").sseData,
             MockJSON.textDelta("Answer").sseData,

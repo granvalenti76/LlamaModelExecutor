@@ -124,7 +124,10 @@ package enum RequestBuilder {
                     "content": text,
                 ])
             case .reasoning:
+                // llama.cpp does not support reasoning in message history;
+                // we skip reasoning transcript entries.
                 break
+
             @unknown default:
                 break
             }
